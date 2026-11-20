@@ -1,0 +1,49 @@
+name: Release
+
+# Pushing a tag such as v0.2.0 publishes a release with a Linux x86_64
+# binary and its SHA-256, which other projects' CI can download and pin
+# the way joe Linux pins Zig. It is built on the oldest supported Ubuntu,
+# so the binary runs on newer glibc systems too.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: test
+        run: cargo test --workspace --locked
+
+      - name: build
+        run: cargo build --release --locked -p neomake
+
+      - name: package
+        run: |
+          name="neomake-${GITHUB_REF_NAME}-x86_64-linux"
+          mkdir "$name"
+          cp target/release/neomake LICENSE README.md "$name/"
+          cp -r docs "$name/"
+          strip "$name/neomake"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" neomake-*-x86_64-linux.tar.gz neomake-*-x86_64-linux.tar.gz.sha256 \
+            --title "neomake $GITHUB_REF_NAME" --generate-notes
