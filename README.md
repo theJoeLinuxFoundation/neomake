@@ -150,14 +150,36 @@ per task under `logs/` and `report.json`, a machine-readable account of
 the run; `runs/latest` names the newest. Every command runs in its own
 process group, which is stopped as a whole at a timeout or on Ctrl-C.
 
+### Tests
+
+`[tests.*]` are tasks that check something: they always run (unless
+`cache = true`), and may be written as steps that check each command's
+exit status and output, capture values for later steps, answer a
+program's questions on a pseudo-terminal, and come in matrix variants.
+A failure names the step and the line it is written on. See
+[docs/testing.md](docs/testing.md).
+
+```toml
+[tests.cli]
+deps = ["dave"]
+steps = [
+  { section = "help" },
+  { run = 'dave --help', contains = "Usage:" },
+  { run = 'dave isntall', exit = "nonzero", stream = "combined", contains = "did you mean 'install'?" },
+]
+```
+
 ### CLI reference
 
 ```
 neomake [OPTIONS] <SUBCOMMAND>
 
 Subcommands:
-  run [TASK]...            Run tasks (defaults to all tasks)
-  list                     Print tasks in topological order
+  run [PATTERN]...         Run tasks and tests (defaults to everything)
+  test [PATTERN]...        Run tests (defaults to every test)
+  list [--tests]           Print tasks and tests in the order they run
+  check                    Check the configuration without running anything
+  log [TASK] [--run ID]    Print a task's log from the last run
   cache clean              Remove every cache entry
   cache status             Print cache size and entry count
 
@@ -165,11 +187,17 @@ Options:
   -c, --config <FILE>      Path to config; auto-detects neomake.toml or neomake.tomlx
       --concurrency <N>    Max parallel commands (default: num_cpus)
       --no-cache           Treat every task as a cache miss
-  -q, --quiet              Suppress per-task stdout/stderr forwarding
+  -q, --quiet              Show only the output of what fails
+  -v, --verbose            Show every step as it passes
 
-run options:
+run and test options:
+      --tag <TAG>          Only what has this tag (repeatable)
+      --exclude-tag <TAG>  Leave out what has this tag (repeatable)
+      --dry-run            Show what would run, be up to date or be skipped
       --fail-fast          Stop at the first failure
       --timeout-scale <F>  Multiply every timeout by F
+      --output <MODE>      stream, grouped or failures
+      --junit <FILE>       Write JUnit XML of the tests to FILE
       --json <FILE>        Also write the run's report to FILE
       --tail <N>           Lines of a failed task's output to show (default 20)
 ```

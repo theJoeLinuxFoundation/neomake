@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::ConfigError;
+use crate::steps::Step;
 
 /// Where something is defined in the configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +146,22 @@ pub struct Task {
     pub interactive: bool,
     /// Where the task is defined.
     pub source: Option<Location>,
+    /// A test's steps (empty for a task, and for a test with a `command`).
+    pub steps: Vec<Step>,
+    /// Shell text put in front of every step that runs on the host.
+    pub prelude: Option<String>,
+    /// Which variant of a matrix this is, if it is one.
+    pub variant: Option<Variant>,
+}
+
+/// One combination of a matrix's values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Variant {
+    /// The name the matrix is written under (`deployments` for
+    /// `deployments[base=joe]`).
+    pub base: String,
+    /// The value of each matrix key, as its name shows it.
+    pub values: Vec<(String, String)>,
 }
 
 impl Task {
@@ -172,7 +189,15 @@ impl Task {
             exclusive: Vec::new(),
             interactive: false,
             source: None,
+            steps: Vec::new(),
+            prelude: None,
+            variant: None,
         }
+    }
+
+    /// Whether this is a test.
+    pub fn is_test(&self) -> bool {
+        self.kind == TaskKind::Test
     }
 
     /// The same task depending on `deps`.

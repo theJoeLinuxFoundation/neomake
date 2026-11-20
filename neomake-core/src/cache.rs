@@ -10,6 +10,8 @@
 //! "neomake-cache-v3\n"
 //! "name:"       <task name>                    "\n"
 //! "command:"    <command-bytes>                "\n"
+//! "prelude:"    <prelude-bytes>                "\n"
+//! "steps:"      <the steps, as Rust debug text> "\n"
 //! "shell:"      for each argv element:         <arg> "\n"     then ".\n"
 //! "cwd:"        <cwd or empty>                 "\n"
 //! "env_clear:"  "0" | "1"                      "\n"
@@ -147,6 +149,11 @@ impl Cache {
         line(&[CACHE_FORMAT_VERSION.as_bytes()]);
         line(&[b"name:", task.name.as_bytes()]);
         line(&[b"command:", task.command.as_bytes()]);
+        line(&[
+            b"prelude:",
+            task.prelude.as_deref().unwrap_or("").as_bytes(),
+        ]);
+        line(&[b"steps:", format!("{:?}", task.steps).as_bytes()]);
         line(&[b"shell:"]);
         let shell_argv = task.shell.clone().unwrap_or_else(|| {
             let default = shell::resolve();

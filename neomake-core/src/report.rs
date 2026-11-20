@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::executor::{RunReport, TaskOutcome, TaskStatus};
 use crate::rundir::rfc3339;
+use crate::steps::StepStatus;
 use crate::task::{Task, TaskKind};
 
 /// What a report says about the run as a whole.
@@ -88,6 +89,34 @@ pub struct ReportTask {
     /// The last lines it printed, if it did not succeed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tail: Vec<String>,
+    /// A test's directory of files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_dir: Option<String>,
+    /// A test's steps.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<ReportStep>,
+}
+
+/// One step of a test in [`ReportTask`].
+#[derive(Debug, Serialize)]
+pub struct ReportStep {
+    /// Position, from 1.
+    pub index: usize,
+    /// What it does.
+    pub label: String,
+    /// Its section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// The line it is written on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    /// `passed`, `failed` or `not_run`.
+    pub status: &'static str,
+    /// Seconds.
+    pub duration: f64,
+    /// Why it failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl Report {
@@ -145,6 +174,27 @@ fn task_entry(o: &TaskOutcome, task: Option<&Task>, root: &Path) -> ReportTask {
             .as_ref()
             .map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string()),
         tail: o.tail.clone(),
+        test_dir: o
+            .test_dir
+            .as_ref()
+            .map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string()),
+        steps: o
+            .steps
+            .iter()
+            .map(|s| ReportStep {
+                index: s.index,
+                label: s.label.clone(),
+                section: s.section.clone(),
+                line: s.line,
+                status: match s.status {
+                    StepStatus::Passed => "passed",
+                    StepStatus::Failed => "failed",
+                    StepStatus::NotRun => "not_run",
+                },
+                duration: secs(s.duration),
+                message: s.message.clone(),
+            })
+            .collect(),
     }
 }
 

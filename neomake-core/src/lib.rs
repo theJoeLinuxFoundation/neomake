@@ -32,10 +32,13 @@ pub mod duration;
 pub mod error;
 pub mod executor;
 pub mod glob;
+pub mod junit;
 pub mod process;
 pub mod report;
 pub mod rundir;
+pub mod select;
 pub mod shell;
+pub mod steps;
 pub mod task;
 
 pub use cache::{Cache, CacheEntry, CacheStatus, OutputRecord};
@@ -43,9 +46,9 @@ pub use config::{Config, Settings};
 pub use dag::Dag;
 pub use error::{CacheError, ConfigError, CoreError, DagError, ExecError};
 pub use executor::{
-    run, select_tasks, ExecutionEvent, Reporter, RunOptions, RunReport, SkipReason, TaskOutcome,
-    TaskStatus,
+    plan, run, select_tasks, ExecutionEvent, PlanEntry, Planned, Reporter, RunOptions, RunReport,
+    SkipReason, TaskOutcome, TaskStatus,
 };
 pub use rundir::RunDir;
 pub use shell::{resolve as resolve_shell, ShellInvocation};
-pub use task::{project_root_for, Location, Requirements, Task, TaskKind, TaskSet};
+pub use task::{project_root_for, Location, Requirements, Task, TaskKind, TaskSet, Variant};

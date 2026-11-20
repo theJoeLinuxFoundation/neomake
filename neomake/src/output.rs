@@ -1,112 +1,195 @@
 //! What a run prints on the terminal.
 //!
-//! Progress lines are tagged by status (`[RUNNING]`, `[OK     ]`, …),
-//! the lines tasks print are prefixed with the task's name (`|` for
-//! stdout, `!` for stderr), and a run ends with a summary that names
-//! every task that did not succeed, its reason and its log, followed by
-//! the last lines of each failure's output when they were not already
-//! shown.
+//! Progress lines are tagged by status (`[RUNNING]`, `[OK     ]`, …).
+//! What tasks print is shown in one of three ways ([`OutputMode`]): as it
+//! comes, prefixed with the task's name (`|` for stdout, `!` for
+//! stderr); grouped, each task's lines together once it ends; or only
+//! the last lines of what failed, at the end. Tests also show their
+//! sections and failing steps, and with `--verbose` every step.
+//!
+//! A run ends with a summary naming every task that did not succeed,
+//! why, and where its log is.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use neomake_core::duration::human;
-use neomake_core::{ExecutionEvent, Reporter, RunReport, TaskStatus};
+use neomake_core::steps::StepStatus;
+use neomake_core::{ExecutionEvent, Reporter, RunReport, Task, TaskStatus};
+
+use crate::cli::OutputMode;
 
 /// Settings of the console output.
 #[derive(Debug, Clone, Copy)]
 pub struct Style {
     /// Use ANSI colours.
     pub color: bool,
-    /// Do not echo the lines tasks print.
-    pub quiet: bool,
+    /// How task output is shown.
+    pub mode: OutputMode,
+    /// Show every step, not only failing ones.
+    pub verbose: bool,
+    /// Running under GitHub Actions: groups and annotations.
+    pub github: bool,
 }
 
 /// The reporter that prints progress to stdout.
 pub fn reporter(style: Style) -> Reporter {
+    let buffers: Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::default();
     let stdout = Arc::new(Mutex::new(io::stdout()));
     Arc::new(move |event: ExecutionEvent| {
         let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
         let c = |color: &str, text: &str| paint(style.color, color, text);
-        let _ = match event {
-            ExecutionEvent::Started { task, attempt } if attempt > 1 => {
-                writeln!(
-                    out,
-                    "{} {task}  (attempt {attempt})",
-                    c("cyan", "[RUNNING]")
-                )
+        // A line of a task's own output (or of its steps' progress).
+        let mut task_line = |task: &str, text: String| match style.mode {
+            OutputMode::Stream => {
+                let _ = writeln!(out, "    {task} {text}");
             }
-            ExecutionEvent::Started { task, .. } => {
-                writeln!(out, "{} {task}", c("cyan", "[RUNNING]"))
+            OutputMode::Grouped => buffers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(task.to_string())
+                .or_default()
+                .push(text),
+            OutputMode::Failures => {}
+        };
+        match event {
+            ExecutionEvent::Stdout { task, line } => task_line(&task, format!("| {line}")),
+            ExecutionEvent::Stderr { task, line } => task_line(&task, format!("! {line}")),
+            ExecutionEvent::Section { task, title } => {
+                let text = format!("== {title}");
+                task_line(&task, c("cyan", &text))
             }
-            ExecutionEvent::Cached { task, key } => {
-                let short: String = key.chars().take(12).collect();
-                writeln!(out, "{} {task}  (key={short}…)", c("yellow", "[CACHED ]"))
-            }
-            ExecutionEvent::Finished {
+            ExecutionEvent::Step {
                 task,
+                index,
+                total,
+                label,
+                passed,
                 duration,
-                attempts,
             } => {
-                let after = if attempts > 1 {
-                    format!(", passed on attempt {attempts}")
-                } else {
-                    String::new()
-                };
-                writeln!(
-                    out,
-                    "{} {task}  ({}{after})",
-                    c("green", "[OK     ]"),
-                    human(duration)
-                )
+                if !passed {
+                    task_line(
+                        &task,
+                        format!("{} step {index}/{total} {label}", c("red", "✗")),
+                    );
+                } else if style.verbose {
+                    task_line(
+                        &task,
+                        format!(
+                            "{} step {index}/{total} {label}  ({})",
+                            c("green", "✓"),
+                            human(duration)
+                        ),
+                    );
+                }
             }
-            ExecutionEvent::Failed {
-                task,
-                message,
-                timed_out,
-                retrying,
-                allowed,
-                ..
-            } => {
-                let tag = if retrying {
-                    c("yellow", "[RETRY  ]")
-                } else if timed_out {
-                    c("red", "[TIMEOUT]")
-                } else {
-                    c("red", "[FAILED ]")
-                };
-                let note = if allowed && !retrying {
-                    " (allowed to fail)"
-                } else {
-                    ""
-                };
-                writeln!(out, "{tag} {task}  {message}{note}")
+            other => {
+                drop(out);
+                status_line(other, style, &buffers);
             }
-            ExecutionEvent::Cancelled { task } => {
-                writeln!(out, "{} {task}  stopped", c("magenta", "[STOPPED]"))
-            }
-            ExecutionEvent::Skipped { task, reason } => writeln!(
-                out,
+        }
+    })
+}
+
+fn status_line(event: ExecutionEvent, style: Style, buffers: &Mutex<HashMap<String, Vec<String>>>) {
+    let mut out = io::stdout().lock();
+    let c = |color: &str, text: &str| paint(style.color, color, text);
+    let (task, line, ended) = match event {
+        ExecutionEvent::Started { task, attempt } => {
+            let line = if attempt > 1 {
+                format!("{} {task}  (attempt {attempt})", c("cyan", "[RUNNING]"))
+            } else {
+                format!("{} {task}", c("cyan", "[RUNNING]"))
+            };
+            (task, line, false)
+        }
+        ExecutionEvent::Cached { task, key } => {
+            let short: String = key.chars().take(12).collect();
+            let line = format!("{} {task}  (key={short}…)", c("yellow", "[CACHED ]"));
+            (task, line, false)
+        }
+        ExecutionEvent::Finished {
+            task,
+            duration,
+            attempts,
+        } => {
+            let after = if attempts > 1 {
+                format!(", passed on attempt {attempts}")
+            } else {
+                String::new()
+            };
+            let line = format!(
+                "{} {task}  ({}{after})",
+                c("green", "[OK     ]"),
+                human(duration)
+            );
+            (task, line, true)
+        }
+        ExecutionEvent::Failed {
+            task,
+            message,
+            timed_out,
+            retrying,
+            allowed,
+            ..
+        } => {
+            let tag = if retrying {
+                c("yellow", "[RETRY  ]")
+            } else if timed_out {
+                c("red", "[TIMEOUT]")
+            } else {
+                c("red", "[FAILED ]")
+            };
+            let note = if allowed && !retrying {
+                " (allowed to fail)"
+            } else {
+                ""
+            };
+            let line = format!("{tag} {task}  {message}{note}");
+            (task, line, !retrying)
+        }
+        ExecutionEvent::Cancelled { task } => {
+            let line = format!("{} {task}  stopped", c("magenta", "[STOPPED]"));
+            (task, line, true)
+        }
+        ExecutionEvent::Skipped { task, reason } => {
+            let line = format!(
                 "{} {task}  ({})",
                 c("magenta", "[SKIPPED]"),
                 reason.describe()
-            ),
-            ExecutionEvent::Stdout { task, line } if !style.quiet => {
-                writeln!(out, "    {task} | {line}")
+            );
+            (task, line, false)
+        }
+        _ => return,
+    };
+    let _ = writeln!(out, "{line}");
+    if ended && style.mode == OutputMode::Grouped {
+        let lines = buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&task)
+            .unwrap_or_default();
+        if !lines.is_empty() {
+            if style.github {
+                let _ = writeln!(out, "::group::{task} output");
             }
-            ExecutionEvent::Stderr { task, line } if !style.quiet => {
-                writeln!(out, "    {task} ! {line}")
+            for l in lines {
+                let _ = writeln!(out, "    {l}");
             }
-            ExecutionEvent::Stdout { .. } | ExecutionEvent::Stderr { .. } => Ok(()),
-        };
-    })
+            if style.github {
+                let _ = writeln!(out, "::endgroup::");
+            }
+        }
+    }
 }
 
 /// The end-of-run summary.
 pub fn summary(
     report: &RunReport,
+    tasks: &[Task],
     elapsed: Duration,
     run_dir: Option<&Path>,
     root: &Path,
@@ -143,10 +226,16 @@ pub fn summary(
         } else {
             paint(style.color, "red", o.status.label())
         };
-        let _ = writeln!(out, "  {tag} {}: {reason}  {log}", o.name);
+        let _ = writeln!(out, "  {tag} {}: {reason}", o.name);
+        if !log.is_empty() {
+            let _ = writeln!(out, "      log: {log}");
+        }
+        if let Some(dir) = &o.test_dir {
+            let _ = writeln!(out, "      files: {}", rel(dir));
+        }
     }
     // Lines the run did not already show.
-    if style.quiet && tail > 0 {
+    if style.mode == OutputMode::Failures && tail > 0 {
         for o in unsuccessful.iter().filter(|o| !o.tail.is_empty()) {
             let shown = &o.tail[o.tail.len().saturating_sub(tail)..];
             let _ = writeln!(out, "--- {} (last {} lines) ---", o.name, shown.len());
@@ -155,12 +244,48 @@ pub fn summary(
             }
         }
     }
+    if style.github {
+        for o in unsuccessful.iter().filter(|o| !o.allowed_failure) {
+            let task = tasks.iter().find(|t| t.name == o.name);
+            let file = task
+                .and_then(|t| t.source.as_ref())
+                .map(|l| rel(&l.file))
+                .unwrap_or_default();
+            // The failing step's line, if a step failed.
+            let line = o
+                .steps
+                .iter()
+                .find(|s| s.status == StepStatus::Failed)
+                .and_then(|s| s.line)
+                .or_else(|| task.and_then(|t| t.source.as_ref()).map(|l| l.line))
+                .unwrap_or(1);
+            let message = o.error.as_deref().unwrap_or("failed");
+            let _ = writeln!(
+                out,
+                "::error file={file},line={line},title={}::{}",
+                escape_property(&o.name),
+                escape_data(message)
+            );
+        }
+    }
     if let Some(dir) = run_dir {
         let _ = writeln!(out, "logs: {}", rel(dir));
     }
 }
 
-fn paint(enabled: bool, color: &str, text: &str) -> String {
+/// GitHub's escaping of a workflow command's message.
+fn escape_data(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+/// GitHub's escaping of a workflow command's property.
+fn escape_property(s: &str) -> String {
+    escape_data(s).replace(':', "%3A").replace(',', "%2C")
+}
+
+pub(crate) fn paint(enabled: bool, color: &str, text: &str) -> String {
     if !enabled {
         return text.to_string();
     }
@@ -170,6 +295,7 @@ fn paint(enabled: bool, color: &str, text: &str) -> String {
         "yellow" => "33",
         "cyan" => "36",
         "magenta" => "35",
+        "dim" => "2",
         _ => return text.to_string(),
     };
     format!("\x1b[{code}m{text}\x1b[0m")

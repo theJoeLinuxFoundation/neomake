@@ -40,6 +40,9 @@ use crate::error::ExecError;
 use crate::process::{self, Invocation, Stream};
 use crate::rundir;
 use crate::shell;
+use crate::steps::host::{self, Ending, HostEnv, Runner};
+use crate::steps::vars::Vars;
+use crate::steps::StepOutcome;
 use crate::task::Task;
 
 /// Why a task did not run.
@@ -145,6 +148,10 @@ pub struct TaskOutcome {
     pub tail: Vec<String>,
     /// The task failed, but `allow_failure` makes that not count.
     pub allowed_failure: bool,
+    /// A test's steps, as they went.
+    pub steps: Vec<StepOutcome>,
+    /// The directory a test's files went to, if it has one.
+    pub test_dir: Option<PathBuf>,
 }
 
 impl TaskOutcome {
@@ -161,6 +168,8 @@ impl TaskOutcome {
             log: None,
             tail: Vec::new(),
             allowed_failure: false,
+            steps: Vec::new(),
+            test_dir: None,
         }
     }
 
@@ -254,6 +263,28 @@ pub enum ExecutionEvent {
         /// Why.
         reason: SkipReason,
     },
+    /// A test started a new section.
+    Section {
+        /// Task name.
+        task: String,
+        /// The section's title.
+        title: String,
+    },
+    /// A test's step ended.
+    Step {
+        /// Task name.
+        task: String,
+        /// Its position, from 1.
+        index: usize,
+        /// How many steps the test has.
+        total: usize,
+        /// What it does.
+        label: String,
+        /// Whether its checks held.
+        passed: bool,
+        /// How long it took.
+        duration: Duration,
+    },
     /// A single line of the task's stdout.
     Stdout {
         /// Task name.
@@ -296,6 +327,8 @@ pub struct RunOptions {
     pub cancel: CancellationToken,
     /// How many of a failed task's last lines its outcome keeps.
     pub tail_lines: usize,
+    /// The run's directory; tests keep their files under `tests/` in it.
+    pub artifact_dir: Option<PathBuf>,
 }
 
 impl RunOptions {
@@ -312,6 +345,7 @@ impl RunOptions {
             log_dir: None,
             cancel: CancellationToken::new(),
             tail_lines: 40,
+            artifact_dir: None,
         }
     }
 }
@@ -351,6 +385,85 @@ pub fn select_tasks(dag: &Dag, targets: &[String]) -> Result<Vec<Task>, ExecErro
         .filter(|t| selected.contains(&t.name))
         .cloned()
         .collect())
+}
+
+/// What a run would do with a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Planned {
+    /// Run it.
+    Run,
+    /// Nothing: the cache holds its result.
+    UpToDate,
+    /// Skip it.
+    Skip(SkipReason),
+}
+
+/// One task of a [`plan`].
+#[derive(Debug, Clone)]
+pub struct PlanEntry {
+    /// The task.
+    pub name: String,
+    /// What would happen to it.
+    pub planned: Planned,
+}
+
+/// What [`run`] would do with `tasks`, without running anything. A task
+/// is up to date only when the cache holds its result and everything it
+/// depends on is up to date too.
+pub fn plan(
+    tasks: &[Task],
+    cache: &Cache,
+    options: &RunOptions,
+) -> Result<Vec<PlanEntry>, ExecError> {
+    let dag = Dag::build(tasks).map_err(|e| ExecError::Plan(e.to_string()))?;
+    let mut keys: HashMap<String, String> = HashMap::new();
+    let mut planned: HashMap<String, Planned> = HashMap::new();
+    let mut out = Vec::new();
+    for name in dag.topo_order() {
+        let task = dag
+            .tasks()
+            .iter()
+            .find(|t| &t.name == name)
+            .expect("in the DAG");
+        let deps = dag.deps_of(name);
+        let upstream_skip = deps
+            .iter()
+            .find(|d| matches!(planned.get(*d), Some(Planned::Skip(_))));
+        let p = if let Some(dep) = upstream_skip {
+            Planned::Skip(SkipReason::Upstream {
+                task: dep.clone(),
+                failed: false,
+            })
+        } else if let Some(reason) = &task.skip {
+            Planned::Skip(SkipReason::Disabled(reason.clone()))
+        } else if let Some(reason) = task.requires.unmet(&options.project_root) {
+            Planned::Skip(SkipReason::Unmet(reason))
+        } else {
+            let dep_keys: Vec<String> = deps.iter().filter_map(|d| keys.get(d).cloned()).collect();
+            let key = cache
+                .compute_key(task, &dep_keys)
+                .map_err(|e| ExecError::Plan(format!("`{name}`: {e}")))?;
+            let deps_up_to_date = deps
+                .iter()
+                .all(|d| planned.get(d) == Some(&Planned::UpToDate));
+            let hit = options.use_cache
+                && task.cache
+                && deps_up_to_date
+                && matches!(cache.lookup(&key), Ok(Some(_)));
+            keys.insert(name.clone(), key);
+            if hit {
+                Planned::UpToDate
+            } else {
+                Planned::Run
+            }
+        };
+        planned.insert(name.clone(), p.clone());
+        out.push(PlanEntry {
+            name: name.clone(),
+            planned: p,
+        });
+    }
+    Ok(out)
 }
 
 /// The name in `names` closest to `wanted`, if one is close enough to be
@@ -606,31 +719,108 @@ fn fail_early(task: &Task, ctx: &Context, message: String) -> TaskOutcome {
     o
 }
 
-/// Run the task's command, as many times as its retries allow.
+/// Where a task's output goes: its log, the tail kept for its outcome,
+/// and the reporter.
+pub(crate) struct Sink {
+    task: String,
+    log: Option<Mutex<std::io::BufWriter<std::fs::File>>>,
+    tail: Mutex<VecDeque<String>>,
+    tail_lines: usize,
+    reporter: Reporter,
+}
+
+impl Sink {
+    fn new(task: &Task, log: Option<&Path>, ctx: &Context) -> Self {
+        Self {
+            task: task.name.clone(),
+            log: log
+                .and_then(|p| std::fs::File::create(p).ok())
+                .map(|f| Mutex::new(std::io::BufWriter::new(f))),
+            tail: Mutex::new(VecDeque::with_capacity(ctx.opts.tail_lines)),
+            tail_lines: ctx.opts.tail_lines,
+            reporter: Arc::clone(&ctx.reporter),
+        }
+    }
+
+    /// The task's name.
+    pub(crate) fn task(&self) -> &str {
+        &self.task
+    }
+
+    /// A line for the log only.
+    pub(crate) fn note(&self, line: String) {
+        if let Some(log) = &self.log {
+            let mut w = log.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = writeln!(w, "{line}");
+        }
+    }
+
+    /// A line the task printed.
+    pub(crate) fn line(&self, stream: Stream, line: String) {
+        self.note(line.clone());
+        if self.tail_lines > 0 {
+            let mut t = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+            if t.len() == self.tail_lines {
+                t.pop_front();
+            }
+            t.push_back(line.clone());
+        }
+        let task = self.task.clone();
+        (self.reporter)(match stream {
+            Stream::Stdout => ExecutionEvent::Stdout { task, line },
+            Stream::Stderr => ExecutionEvent::Stderr { task, line },
+        });
+    }
+
+    /// An event for the reporter.
+    pub(crate) fn event(&self, event: ExecutionEvent) {
+        (self.reporter)(event);
+    }
+
+    fn take_tail(&self) -> Vec<String> {
+        self.tail
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    fn flush(&self) {
+        if let Some(log) = &self.log {
+            let _ = log.lock().unwrap_or_else(|e| e.into_inner()).flush();
+        }
+    }
+}
+
+/// How one attempt went.
+struct Attempt {
+    status: TaskStatus,
+    exit_code: Option<i32>,
+    message: Option<String>,
+    steps: Vec<StepOutcome>,
+}
+
+/// Run the task, as many times as its retries allow.
 async fn execute(task: &Task, ctx: &Context) -> TaskOutcome {
-    let reporter = &ctx.reporter;
     let log_path = ctx
         .opts
         .log_dir
         .as_ref()
         .map(|dir| dir.join(format!("{}.log", rundir::file_name_for(&task.name))));
-    let log = log_path
-        .as_ref()
-        .and_then(|p| std::fs::File::create(p).ok())
-        .map(|f| Arc::new(Mutex::new(std::io::BufWriter::new(f))));
-    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(ctx.opts.tail_lines)));
-    let note = |line: String| {
-        if let Some(log) = &log {
-            let mut w = log.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = writeln!(w, "{line}");
-        }
+    let sink = Sink::new(task, log_path.as_deref(), ctx);
+    let test_dir = if task.is_test() {
+        ctx.opts.artifact_dir.as_ref().and_then(|dir| {
+            let d = dir.join("tests").join(rundir::file_name_for(&task.name));
+            std::fs::create_dir_all(&d).ok().map(|_| d)
+        })
+    } else {
+        None
     };
 
     let timeout = task
         .timeout
         .or(ctx.opts.default_timeout)
         .map(|t| t.mul_f64(ctx.opts.timeout_scale.max(0.0)));
-    let invocation = invocation_for(task, &ctx.opts);
     let started_at = SystemTime::now();
     let started = Instant::now();
     let max_attempts = task.retries + 1;
@@ -638,167 +828,244 @@ async fn execute(task: &Task, ctx: &Context) -> TaskOutcome {
     outcome.started_at = Some(started_at);
     outcome.log = log_path.clone();
     outcome.allowed_failure = task.allow_failure;
+    outcome.test_dir = test_dir.clone();
 
     for attempt in 1..=max_attempts {
         outcome.attempts = attempt;
         if attempt > 1 {
-            note(format!("--- attempt {attempt} of {max_attempts} ---"));
+            sink.note(format!("--- attempt {attempt} of {max_attempts} ---"));
         }
-        reporter(ExecutionEvent::Started {
+        sink.event(ExecutionEvent::Started {
             task: task.name.clone(),
             attempt,
         });
 
-        let invocation = match &invocation {
-            Ok(inv) => inv,
-            Err(message) => {
-                note(message.clone());
-                outcome.error = Some(message.clone());
-                reporter(ExecutionEvent::Failed {
-                    task: task.name.clone(),
-                    exit_code: None,
-                    message: message.clone(),
-                    timed_out: false,
-                    retrying: false,
-                    allowed: task.allow_failure,
-                });
-                break;
-            }
+        let result = if task.steps.is_empty() {
+            command_attempt(task, ctx, &sink, timeout).await
+        } else {
+            steps_attempt(task, ctx, &sink, timeout, test_dir.as_deref()).await
         };
+        outcome.status = result.status.clone();
+        outcome.exit_code = result.exit_code;
+        outcome.error = result.message.clone();
+        outcome.steps = result.steps;
 
-        let name = task.name.clone();
-        let result = process::run(invocation, timeout, &ctx.opts.cancel, |stream, line| {
-            note(line.clone());
-            {
-                let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
-                if t.len() == ctx.opts.tail_lines {
-                    t.pop_front();
-                }
-                if ctx.opts.tail_lines > 0 {
-                    t.push_back(line.clone());
-                }
-            }
-            reporter(match stream {
-                Stream::Stdout => ExecutionEvent::Stdout {
-                    task: name.clone(),
-                    line,
-                },
-                Stream::Stderr => ExecutionEvent::Stderr {
-                    task: name.clone(),
-                    line,
-                },
-            });
-        })
-        .await;
-
-        let retrying = attempt < max_attempts && !ctx.opts.cancel.is_cancelled();
-        match result {
-            Ok(exit) if exit.success() => {
-                outcome.status = TaskStatus::Success;
-                outcome.exit_code = Some(0);
-                outcome.error = None;
-                break;
-            }
-            Ok(exit) if exit.cancelled => {
-                outcome.status = TaskStatus::Cancelled;
-                outcome.exit_code = Some(exit.status());
-                outcome.error = Some("stopped: the run was cancelled".into());
-                note("--- stopped: the run was cancelled ---".into());
-                reporter(ExecutionEvent::Cancelled {
+        match &result.status {
+            TaskStatus::Success => break,
+            TaskStatus::Cancelled => {
+                sink.note("--- stopped: the run was cancelled ---".into());
+                sink.event(ExecutionEvent::Cancelled {
                     task: task.name.clone(),
                 });
                 break;
             }
-            Ok(exit) => {
-                let message = if exit.timed_out {
-                    format!(
-                        "timed out after {}",
-                        crate::duration::human(timeout.unwrap_or_default())
-                    )
-                } else {
-                    exit.describe()
-                };
-                note(format!("--- {message} ---"));
-                outcome.status = if exit.timed_out {
-                    TaskStatus::TimedOut
-                } else {
-                    TaskStatus::Failed
-                };
-                outcome.exit_code = Some(exit.status());
-                outcome.error = Some(message.clone());
-                reporter(ExecutionEvent::Failed {
-                    task: task.name.clone(),
-                    exit_code: Some(exit.status()),
-                    message,
-                    timed_out: exit.timed_out,
-                    retrying,
-                    allowed: task.allow_failure,
-                });
-            }
-            Err(e) => {
-                let message = format!("could not start `{}`: {e}", invocation.program);
-                note(message.clone());
-                outcome.status = TaskStatus::Failed;
-                outcome.exit_code = None;
-                outcome.error = Some(message.clone());
-                reporter(ExecutionEvent::Failed {
-                    task: task.name.clone(),
-                    exit_code: None,
-                    message,
-                    timed_out: false,
-                    retrying,
-                    allowed: task.allow_failure,
-                });
-            }
+            _ => {}
         }
+        let retrying = attempt < max_attempts && !ctx.opts.cancel.is_cancelled();
+        let message = result.message.unwrap_or_else(|| "failed".into());
+        sink.note(format!("--- {message} ---"));
+        sink.event(ExecutionEvent::Failed {
+            task: task.name.clone(),
+            exit_code: result.exit_code,
+            message,
+            timed_out: result.status == TaskStatus::TimedOut,
+            retrying,
+            allowed: task.allow_failure,
+        });
         if !retrying {
             break;
         }
     }
 
     outcome.duration = started.elapsed();
-    if let Some(log) = &log {
-        let _ = log.lock().unwrap_or_else(|e| e.into_inner()).flush();
-    }
-    if outcome.status != TaskStatus::Success {
-        outcome.tail = tail
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .collect();
-    } else {
-        reporter(ExecutionEvent::Finished {
+    sink.flush();
+    if outcome.status == TaskStatus::Success {
+        sink.event(ExecutionEvent::Finished {
             task: task.name.clone(),
             duration: outcome.duration,
             attempts: outcome.attempts,
         });
+    } else {
+        outcome.tail = sink.take_tail();
     }
     outcome
 }
 
-/// How `task` is started, or why it cannot be.
-fn invocation_for(task: &Task, opts: &RunOptions) -> Result<Invocation, String> {
-    let argv: Vec<String> = match task.shell.as_ref().or(opts.default_shell.as_ref()) {
+/// One attempt at a task's command.
+async fn command_attempt(
+    task: &Task,
+    ctx: &Context,
+    sink: &Sink,
+    timeout: Option<Duration>,
+) -> Attempt {
+    let failed = |message: String| Attempt {
+        status: TaskStatus::Failed,
+        exit_code: None,
+        message: Some(message),
+        steps: Vec::new(),
+    };
+    let invocation = match invocation_for(task, &ctx.opts) {
+        Ok(inv) => inv,
+        Err(message) => return failed(message),
+    };
+    let result = process::run(&invocation, timeout, &ctx.opts.cancel, |stream, line| {
+        sink.line(stream, line)
+    })
+    .await;
+    match result {
+        Ok(exit) if exit.success() => Attempt {
+            status: TaskStatus::Success,
+            exit_code: Some(0),
+            message: None,
+            steps: Vec::new(),
+        },
+        Ok(exit) if exit.cancelled => Attempt {
+            status: TaskStatus::Cancelled,
+            exit_code: Some(exit.status()),
+            message: Some("stopped: the run was cancelled".into()),
+            steps: Vec::new(),
+        },
+        Ok(exit) if exit.timed_out => Attempt {
+            status: TaskStatus::TimedOut,
+            exit_code: Some(exit.status()),
+            message: Some(format!(
+                "timed out after {}",
+                crate::duration::human(timeout.unwrap_or_default())
+            )),
+            steps: Vec::new(),
+        },
+        Ok(exit) => Attempt {
+            status: TaskStatus::Failed,
+            exit_code: Some(exit.status()),
+            message: Some(exit.describe()),
+            steps: Vec::new(),
+        },
+        Err(e) => failed(format!("could not start `{}`: {e}", invocation.program)),
+    }
+}
+
+/// One attempt at a test's steps.
+async fn steps_attempt(
+    task: &Task,
+    ctx: &Context,
+    sink: &Sink,
+    timeout: Option<Duration>,
+    test_dir: Option<&Path>,
+) -> Attempt {
+    let failed = |message: String| Attempt {
+        status: TaskStatus::Failed,
+        exit_code: None,
+        message: Some(message),
+        steps: Vec::new(),
+    };
+    let cwd = match cwd_for(task, &ctx.opts) {
+        Ok(cwd) => cwd,
+        Err(message) => return failed(message),
+    };
+    let mut vars = base_vars(task, &ctx.opts, test_dir);
+    let mut env = task.env.clone();
+    if let Some(dir) = test_dir {
+        env.insert(
+            "NEOMAKE_TEST_DIR".into(),
+            absolute(dir).display().to_string(),
+        );
+        vars.set("test.dir", absolute(dir).display().to_string());
+    }
+    let mut host_env = HostEnv {
+        shell: shell_argv(task, &ctx.opts),
+        cwd,
+        env,
+        env_clear: task.env_clear,
+        prelude: task.prelude.clone(),
+        deadline: timeout.map(|t| Instant::now() + t),
+        cancel: &ctx.opts.cancel,
+        vars,
+    };
+    let file = task.source.as_ref().map(|l| {
+        l.file
+            .strip_prefix(&ctx.opts.project_root)
+            .unwrap_or(&l.file)
+            .display()
+            .to_string()
+    });
+    let mut result = host::run(&task.steps, file.as_deref(), &mut host_env, sink).await;
+    if result.ending != Ending::Passed {
+        Runner::not_run_after(&mut result, &task.steps);
+    }
+    Attempt {
+        status: match result.ending {
+            Ending::Passed => TaskStatus::Success,
+            Ending::Failed => TaskStatus::Failed,
+            Ending::TimedOut => TaskStatus::TimedOut,
+            Ending::Cancelled => TaskStatus::Cancelled,
+        },
+        exit_code: result.exit_code,
+        message: result.message,
+        steps: result.steps,
+    }
+}
+
+/// The variables every test's placeholders can use.
+fn base_vars(task: &Task, opts: &RunOptions, test_dir: Option<&Path>) -> Vars {
+    let mut vars = Vars::default();
+    vars.set("test.name", task.name.clone());
+    vars.set(
+        "project.root",
+        absolute(&opts.project_root).display().to_string(),
+    );
+    if let Some(dir) = &opts.artifact_dir {
+        vars.set("run.dir", absolute(dir).display().to_string());
+    }
+    if let Some(dir) = test_dir {
+        vars.set("test.dir", absolute(dir).display().to_string());
+    }
+    vars
+}
+
+fn absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let path = path.strip_prefix(".").unwrap_or(path);
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The shell `task` runs its commands with.
+fn shell_argv(task: &Task, opts: &RunOptions) -> Vec<String> {
+    match task.shell.as_ref().or(opts.default_shell.as_ref()) {
         Some(argv) => argv.clone(),
         None => {
             let s = shell::resolve();
             std::iter::once(s.program).chain(s.args).collect()
         }
-    };
-    let (program, args) = argv
-        .split_first()
-        .ok_or_else(|| "the shell is empty".to_string())?;
+    }
+}
+
+/// The directory `task` runs in, or why it cannot.
+fn cwd_for(task: &Task, opts: &RunOptions) -> Result<PathBuf, String> {
     let cwd = match &task.cwd {
         Some(dir) => opts.project_root.join(dir),
         None => opts.project_root.clone(),
     };
-    if !cwd.is_dir() {
-        return Err(format!(
+    if cwd.is_dir() {
+        Ok(cwd)
+    } else {
+        Err(format!(
             "the working directory {} does not exist",
             display_rel(&cwd)
-        ));
+        ))
     }
+}
+
+/// How `task` is started, or why it cannot be.
+fn invocation_for(task: &Task, opts: &RunOptions) -> Result<Invocation, String> {
+    let argv = shell_argv(task, opts);
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| "the shell is empty".to_string())?;
+    let cwd = cwd_for(task, opts)?;
     let mut args = args.to_vec();
     args.push(task.command.clone());
     Ok(Invocation {
@@ -1094,7 +1361,7 @@ mod tests {
         let mut opts = RunOptions::new(tmp.path(), 1);
         opts.log_dir = Some(tmp.path().join("logs"));
         opts.tail_lines = 2;
-        let mut t = mk("t[x=1]", "echo one; echo two; echo three >&2; exit 2", &[]);
+        let mut t = mk("t[x=1]", "echo one; echo two; echo three; exit 2", &[]);
         t.cwd = Some("sub".into());
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
         let report = run_in(tmp.path(), &[t], &opts).await;
