@@ -183,7 +183,8 @@ enum State {
 
 enum Handle {
     Child {
-        child: tokio::process::Child,
+        // Boxed: a child process is large on Windows.
+        child: Box<tokio::process::Child>,
         group: Option<u32>,
     },
     Serve {
@@ -510,7 +511,14 @@ impl Services {
                     vars.push((format!("{p}.url"), format!("http://{addr}")));
                 }
                 let detail = addr.unwrap_or_else(|| crate::steps::summarize(command));
-                Ok((vars, Handle::Child { child, group }, detail))
+                Ok((
+                    vars,
+                    Handle::Child {
+                        child: Box::new(child),
+                        group,
+                    },
+                    detail,
+                ))
             }
         }
     }
