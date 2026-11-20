@@ -120,7 +120,7 @@ pub async fn run(
 ) -> StepsResult {
     let mut runner = Runner::new(steps, file);
     for (i, step) in steps.iter().enumerate() {
-        if !runner.begin(i, step, env.cancel, sink) {
+        if !runner.begin(i, step, &env.vars, env.cancel, sink) {
             continue;
         }
         let started = Instant::now();
@@ -148,6 +148,13 @@ pub struct Runner<'f> {
     section: Option<String>,
     outcomes: Vec<StepOutcome>,
     stopped: Option<StepsResult>,
+    /// What the soft steps that failed said, and the exit status of the
+    /// first.
+    soft_failures: Vec<String>,
+    soft_exit_code: Option<i32>,
+    /// What the step begun last does, with the placeholders known when
+    /// it began filled in.
+    label: String,
 }
 
 impl<'f> Runner<'f> {
@@ -164,6 +171,9 @@ impl<'f> Runner<'f> {
             section: None,
             outcomes: Vec::new(),
             stopped: None,
+            soft_failures: Vec::new(),
+            soft_exit_code: None,
+            label: String::new(),
         }
     }
 
@@ -174,6 +184,7 @@ impl<'f> Runner<'f> {
         &mut self,
         i: usize,
         step: &Step,
+        vars: &Vars,
         cancel: &CancellationToken,
         sink: &Sink,
     ) -> bool {
@@ -181,6 +192,7 @@ impl<'f> Runner<'f> {
             return false;
         }
         self.position = i;
+        self.label = super::vars::substitute_known(&step.describe(), &|name| vars.get(name));
         if let Action::Section(title) = &step.action {
             self.section = Some(title.clone());
             sink.note(format!("=== {title}"));
@@ -209,7 +221,7 @@ impl<'f> Runner<'f> {
             self.number,
             self.total,
             self.at(step),
-            step.describe()
+            self.label
         ));
         true
     }
@@ -227,7 +239,7 @@ impl<'f> Runner<'f> {
             task: sink.task().to_string(),
             index: self.number,
             total: self.total,
-            label: step.describe(),
+            label: self.label.clone(),
             passed: result.is_ok(),
             duration,
         });
@@ -235,12 +247,33 @@ impl<'f> Runner<'f> {
             Ok(()) => {
                 self.outcomes.push(StepOutcome {
                     index: self.number,
-                    label: step.describe(),
+                    label: self.label.clone(),
                     section: self.section.clone(),
                     line: step.line,
                     status: StepStatus::Passed,
                     duration,
                     message: None,
+                });
+                None
+            }
+            Err(failure) if step.soft && failure.ending == Ending::Failed => {
+                sink.note(format!(
+                    "--- step {} failed, and the test goes on (soft): {}",
+                    self.number, failure.message
+                ));
+                if self.soft_failures.is_empty() {
+                    self.soft_exit_code = failure.exit_code;
+                }
+                self.soft_failures
+                    .push(self.failure_message(step, &failure));
+                self.outcomes.push(StepOutcome {
+                    index: self.number,
+                    label: self.label.clone(),
+                    section: self.section.clone(),
+                    line: step.line,
+                    status: StepStatus::Failed,
+                    duration,
+                    message: Some(failure.message),
                 });
                 None
             }
@@ -252,6 +285,17 @@ impl<'f> Runner<'f> {
                 Some(self.end(failure, Some(duration), step))
             }
         }
+    }
+
+    fn failure_message(&self, step: &Step, failure: &StepFailure) -> String {
+        format!(
+            "step {}/{}{} `{}`: {}",
+            self.number,
+            self.total,
+            self.at(step),
+            self.label,
+            failure.message
+        )
     }
 
     fn at(&self, step: &Step) -> String {
@@ -270,18 +314,17 @@ impl<'f> Runner<'f> {
         duration: Option<Duration>,
         step: &Step,
     ) -> StepsResult {
-        let message = format!(
-            "step {}/{}{} `{}`: {}",
-            self.number,
-            self.total,
-            self.at(step),
-            step.describe(),
-            failure.message
-        );
+        let mut message = self.failure_message(step, &failure);
+        if !self.soft_failures.is_empty() {
+            message.push_str(&format!(
+                "\n  and before it, softly:\n  {}",
+                self.soft_failures.join("\n  ")
+            ));
+        }
         let mut outcomes = std::mem::take(&mut self.outcomes);
         outcomes.push(StepOutcome {
             index: self.number,
-            label: step.describe(),
+            label: self.label.clone(),
             section: self.section.clone(),
             line: step.line,
             status: if duration.is_some() {
@@ -331,10 +374,20 @@ impl<'f> Runner<'f> {
         if let Some(stopped) = self.stopped.take() {
             return stopped;
         }
+        let failed = std::mem::take(&mut self.soft_failures);
+        let message = match failed.len() {
+            0 => None,
+            1 => failed.into_iter().next(),
+            n => Some(format!("{n} steps failed:\n  {}", failed.join("\n  "))),
+        };
         StepsResult {
-            ending: Ending::Passed,
-            message: None,
-            exit_code: None,
+            ending: if message.is_some() {
+                Ending::Failed
+            } else {
+                Ending::Passed
+            },
+            message,
+            exit_code: self.soft_exit_code,
             steps: std::mem::take(&mut self.outcomes),
             resume: usize::MAX,
             number: self.number,

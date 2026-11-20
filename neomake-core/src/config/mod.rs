@@ -896,7 +896,7 @@ steps = [{ run = 'dave install {{pkg}}', contains = "{{n}} to install." }]
             ),
             (
                 "{ use = 'tpl', with = { a = 1 }, run = 'x' }",
-                "only `use` and `with`",
+                "only `use`, `with` and `soft`",
             ),
         ] {
             let text = format!("{template}[tests.t]\nsteps = [{step}]\n");

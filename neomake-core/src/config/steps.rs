@@ -60,6 +60,8 @@ pub(super) struct RawStep {
     interval: Option<RawDuration>,
     #[serde(default)]
     tty: Option<TtyValue>,
+    #[serde(default)]
+    soft: Option<bool>,
     // What only machine tests do.
     #[serde(default)]
     expect: Option<String>,
@@ -298,7 +300,7 @@ fn expand(
     };
     if let Some(key) = other_keys_than_use(raw) {
         return Err(err(format!(
-            "a step that uses a template takes only `use` and `with`, not `{key}`"
+            "a step that uses a template takes only `use`, `with` and `soft`, not `{key}`"
         )));
     }
     let template = templates.by_name.get(name).ok_or_else(|| {
@@ -358,6 +360,9 @@ fn expand(
         }
         let label = format!("{name} › {}", step.describe());
         step.label = Some(label);
+        if raw.soft == Some(true) {
+            step.soft = true;
+        }
         // Reported where the template is used.
         step.line = Some(line);
         out.push(step);
@@ -564,7 +569,11 @@ fn convert_one(raw: &RawStep, line: usize) -> Result<Step, String> {
 
     let runs = action.runs_a_command();
     if !runs
-        && (!check.is_default() || tty.is_some() || raw.wait.is_some() || raw.timeout.is_some())
+        && (!check.is_default()
+            || tty.is_some()
+            || raw.wait.is_some()
+            || raw.timeout.is_some()
+            || raw.soft.is_some())
     {
         return Err(format!(
             "a `{action_name}` step runs nothing, so it has nothing to check"
@@ -624,6 +633,7 @@ fn convert_one(raw: &RawStep, line: usize) -> Result<Step, String> {
             within,
             interval: interval.unwrap_or(Duration::from_secs(1)),
         }),
+        soft: raw.soft.unwrap_or(false),
     })
 }
 
@@ -752,6 +762,7 @@ fn convert_machine_step(raw: &RawStep, line: usize, action_name: &str) -> Result
         check: Check::default(),
         timeout,
         wait: None,
+        soft: raw.soft.unwrap_or(false),
     })
 }
 

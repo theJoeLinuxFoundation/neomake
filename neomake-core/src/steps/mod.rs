@@ -35,6 +35,9 @@ pub struct Step {
     pub timeout: Option<Duration>,
     /// Repeat the step until its checks pass, for at most this long.
     pub wait: Option<Wait>,
+    /// A failure is recorded and the test goes on, to fail when its
+    /// steps are done.
+    pub soft: bool,
 }
 
 /// How a step is repeated until it passes.
@@ -589,6 +592,7 @@ mod tests {
             check: Check::default(),
             timeout: None,
             wait: None,
+            soft: false,
         };
         assert_eq!(step.describe(), "run: dave install hello…");
     }

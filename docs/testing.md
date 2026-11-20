@@ -108,6 +108,13 @@ file and line it is written on, and what was expected:
 [FAILED ] cli-install  step 4/5 (tests/cli.tomlx:23) `run: dave isntall hello`: expected the output to contain "did you mean 'install'?"
 ```
 
+A step with `soft = true` does not end the test when it fails: the
+failure is recorded, the steps after it run, and the test fails when
+they are done, listing every soft step that failed. It suits a row of
+independent checks, such as each of a desktop's applications starting,
+where knowing all that fail is worth more than stopping at the first.
+On a `use` step, `soft = true` makes each of the template's steps soft.
+
 A step can be named with `name = "…"`, which is then used instead of its
 command in progress and reports.
 

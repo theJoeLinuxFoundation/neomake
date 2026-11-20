@@ -161,6 +161,86 @@ fn a_failing_step_is_named_with_its_line() {
 }
 
 #[test]
+fn soft_steps_fail_the_test_when_its_steps_are_done() {
+    let tmp = project();
+    fs::write(
+        tmp.path().join("tests/soft.tomlx"),
+        r#"
+[templates.is-two]
+params = ["n"]
+steps = [{ run = 'test {{n}} = 2', name = "{{n}} is 2" }]
+
+[tests.soft]
+steps = [
+  { run = 'echo one; false', soft = true, name = "first" },
+  { run = 'echo ran > ran' },
+  { use = "is-two", with = { n = 3 }, soft = true },
+  { use = "is-two", with = { n = 2 }, soft = true },
+]
+
+[tests.soft-then-hard]
+steps = [
+  { run = 'false', soft = true, name = "soft" },
+  { run = 'false', name = "hard" },
+  { run = 'true' },
+]
+
+[tests.labels]
+steps = [
+  { run = 'echo 7', capture = "seven" },
+  { run = 'test {{seven}} = 8', name = "{{seven}} is 8" },
+]
+"#,
+    )
+    .unwrap();
+    let (code, stdout, _) = neomake(tmp.path(), &["test", "soft", "--json", "report.json"]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(
+        stdout.contains("soft: 2 steps failed:\n  step 1/4 (tests/soft.tomlx:8) `first`: "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("step 3/4 (tests/soft.tomlx:10) `is-two › 3 is 2`"),
+        "{stdout}"
+    );
+    // The steps after a soft failure ran.
+    assert!(tmp.path().join("ran").exists());
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join("report.json")).unwrap()).unwrap();
+    let steps = report["tasks"][0]["steps"].as_array().unwrap();
+    let statuses: Vec<&str> = steps
+        .iter()
+        .map(|s| s["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, vec!["failed", "passed", "failed", "passed"]);
+
+    let (code, stdout, _) = neomake(tmp.path(), &["test", "soft-then-hard"]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(
+        stdout.contains("step 2/3 (tests/soft.tomlx:17) `hard`: ")
+            && stdout.contains("and before it, softly:\n  step 1/3 (tests/soft.tomlx:16) `soft`"),
+        "{stdout}"
+    );
+
+    // A step is described with what earlier steps captured.
+    let (code, stdout, _) = neomake(tmp.path(), &["test", "labels"]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(
+        stdout.contains("step 2/2 (tests/soft.tomlx:24) `7 is 8`: "),
+        "{stdout}"
+    );
+
+    fs::write(
+        tmp.path().join("tests/soft.tomlx"),
+        "[tests.bad]\nsteps = [{ section = \"x\", soft = true }]\n",
+    )
+    .unwrap();
+    let (code, _, stderr) = neomake(tmp.path(), &["check"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("runs nothing"), "{stderr}");
+}
+
+#[test]
 fn selection_by_pattern_matrix_and_tag() {
     let tmp = project();
     let (code, stdout, _) = neomake(tmp.path(), &["test", "--dry-run"]);

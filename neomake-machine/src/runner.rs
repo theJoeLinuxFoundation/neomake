@@ -103,7 +103,7 @@ pub async fn run_test(
     let mut runner = Runner::new(&task.steps, file.as_deref());
     let mut result = None;
     for (i, step) in task.steps.iter().enumerate() {
-        if !runner.begin(i, step, &cancel, sink) {
+        if !runner.begin(i, step, &env.host.vars, &cancel, sink) {
             continue;
         }
         let started = Instant::now();
