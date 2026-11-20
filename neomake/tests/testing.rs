@@ -247,6 +247,7 @@ fn grouped_output_on_github_actions() {
     assert!(md.contains("| ❌ | `broken` |"), "{md}");
 }
 
+#[cfg(target_os = "linux")]
 fn have(program: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {program}")])

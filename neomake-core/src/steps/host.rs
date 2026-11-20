@@ -428,6 +428,8 @@ enum Ended {
     Exited,
     TimedOut,
     Cancelled,
+    // Only a terminal step (Unix only) can show forbidden output.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Forbidden(String),
 }
 
