@@ -1,28 +1,31 @@
 //! CLI surface for `neomake`.
 //!
-//! Parsed with `clap` (derive). The CLI is intentionally small:
+//! Parsed with `clap` (derive):
 //!
 //! ```text
-//! neomake [--config <FILE>] [--concurrency N] run [TASK]...
-//! neomake [--config <FILE>]                       list
-//! neomake                                           cache clean
-//! neomake                                           cache status
+//! neomake [-c FILE] [--concurrency N] [--no-cache] [-q] run [TASK]... [run options]
+//! neomake [-c FILE]                                     list
+//! neomake [-c FILE]                                     cache clean | cache status
 //! ```
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// Top-level CLI arguments.
 #[derive(Debug, Parser)]
-#[command(name = "neomake", version, about = "A TOML/TOMLX build orchestrator.")]
+#[command(
+    name = "neomake",
+    version,
+    about = "A TOML/TOMLX task runner and test harness."
+)]
 pub struct Cli {
     /// Path to the configuration file. If omitted, `neomake.toml` then
     /// `neomake.tomlx` are tried in the current directory.
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
-    /// Maximum number of tasks that may run shell commands concurrently.
+    /// Maximum number of tasks that may run commands concurrently.
     #[arg(long, global = true)]
     pub concurrency: Option<usize>,
 
@@ -45,15 +48,40 @@ pub enum Command {
     /// Run one or more tasks (and their dependencies). If no task name
     /// is given, every task is run.
     Run {
-        /// Names of tasks to build.
+        /// Names of tasks to run.
         #[arg(value_name = "TASK")]
         tasks: Vec<String>,
+        /// How the run behaves.
+        #[command(flatten)]
+        options: RunArgs,
     },
     /// List every task in topological order with its dependencies.
     List,
     /// Cache management subcommands.
     #[command(subcommand)]
     Cache(CacheCommand),
+}
+
+/// Options of `run`.
+#[derive(Debug, Args, Clone)]
+pub struct RunArgs {
+    /// Stop at the first failure: running tasks are stopped and the rest
+    /// are not started.
+    #[arg(long)]
+    pub fail_fast: bool,
+
+    /// Multiply every timeout by this factor (for a slow host, say 2).
+    #[arg(long, value_name = "FACTOR", default_value_t = 1.0)]
+    pub timeout_scale: f64,
+
+    /// Also write the run's report (as in the run directory's
+    /// report.json) to this file.
+    #[arg(long, value_name = "FILE")]
+    pub json: Option<PathBuf>,
+
+    /// How many of a failed task's last lines to show.
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    pub tail: usize,
 }
 
 /// `cache` subcommands.

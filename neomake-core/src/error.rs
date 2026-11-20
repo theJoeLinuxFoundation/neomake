@@ -75,28 +75,23 @@ pub enum DagError {
 /// Errors produced while executing tasks.
 #[derive(Debug, Error)]
 pub enum ExecError {
-    /// The task's command exited with a non-zero status.
-    #[error("task `{task}` failed with exit code {code}")]
-    TaskFailed {
-        /// Name of the failing task.
-        task: String,
-        /// Exit code returned by the command (or -1 if terminated by signal).
-        code: i32,
+    /// A task named on the command line does not exist.
+    #[error("no task named `{name}`{}", suggestion.as_ref().map(|s| format!(" (did you mean `{s}`?)")).unwrap_or_default())]
+    UnknownTask {
+        /// The name given.
+        name: String,
+        /// The closest existing name, if one is close.
+        suggestion: Option<String>,
     },
 
-    /// Task was skipped because an upstream dependency failed.
-    #[error("task `{task}` skipped because upstream dependency `{upstream}` failed")]
-    UpstreamFailed {
-        /// Name of the skipped task.
-        task: String,
-        /// Name of the upstream task whose failure caused the skip.
-        upstream: String,
-    },
+    /// The selected tasks could not be scheduled.
+    #[error("{0}")]
+    Plan(String),
 
-    /// Transient I/O error encountered while launching a task.
+    /// I/O error encountered while preparing a run.
     #[error("task `{task}`: i/o error: {source}")]
     Io {
-        /// Name of the task being launched.
+        /// Name of the task (or part of the run) being prepared.
         task: String,
         /// Underlying I/O error.
         #[source]

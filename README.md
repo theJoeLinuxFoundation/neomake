@@ -87,11 +87,10 @@ NEOMAKE_SHELL="bash -c"          neomake run     # force bash
 NEOMAKE_SHELL="cmd /S /C"        neomake run     # force cmd.exe on Windows
 ```
 
-> **Cache compatibility.** This release bumps the cache format to
-> `neomake-cache-v2` so input paths are hashed with portable `/`
-> separators. Existing entries written by an older neomake will miss
-> on first run after upgrading; use `neomake cache clean` if you want
-> to reclaim the disk space immediately.
+> **Cache compatibility.** The cache format is `neomake-cache-v3`: the
+> key now covers a task's name, shell, working directory and output
+> patterns as well. Entries written by an older neomake miss once after
+> upgrading; `neomake cache clean` reclaims their space.
 
 > **Windows PowerShell 5.1 redirection.** `>` writes UTF-16 + BOM by
 > default in 5.1 (this is fixed in pwsh / PowerShell 7+). For
@@ -116,12 +115,40 @@ deps    = ["build"]
 Then:
 
 ```bash
-neomake run               # builds all leaves (test → build)
+neomake run               # runs every task (test → build)
 neomake run build         # builds just `build` and its deps
 neomake list              # shows the DAG in topological order
 neomake cache status      # prints cache entry count and size
 neomake cache clean       # empties the cache directory
 ```
+
+### Task fields
+
+| Field | Meaning |
+|---|---|
+| `command` | The shell command (required). |
+| `deps` | Tasks that must succeed first. |
+| `inputs`, `outputs` | Glob patterns; inputs are hashed into the cache key, outputs checked on a hit. |
+| `env`, `env_clear` | Variables to set; start from an empty environment. |
+| `cwd` | Working directory, relative to the project root. |
+| `shell` | `"bash -euo pipefail -c"` or an argv array; the command is appended. |
+| `timeout`, `retries` | `"10m"`, `"1h30m"`, `"500ms"` or seconds; repeat a failed attempt this often. |
+| `cache` | `false` to always run (the default for tests). |
+| `allow_failure` | A failure does not fail the run. |
+| `requires` | `{ commands = [...], files = [...], env = [...] }`: when unmet, the task is skipped with the reason instead of failing. |
+| `skip` | A reason to skip the task (or `true`). |
+| `exclusive` | Named locks: tasks naming the same one never overlap. |
+| `interactive` | Run alone, attached to the terminal. |
+| `description`, `tags` | For people, and for selecting tasks. |
+
+`[settings]` in the top-level file sets `state_dir` (where the cache,
+runs and logs go; `.neomake` by default), `default_timeout`, `shell` and
+`keep_runs`.
+
+Every run gets a directory `<state_dir>/runs/<time>/` holding one log
+per task under `logs/` and `report.json`, a machine-readable account of
+the run; `runs/latest` names the newest. Every command runs in its own
+process group, which is stopped as a whole at a timeout or on Ctrl-C.
 
 ### CLI reference
 
@@ -136,10 +163,19 @@ Subcommands:
 
 Options:
   -c, --config <FILE>      Path to config; auto-detects neomake.toml or neomake.tomlx
-      --concurrency <N>    Max parallel shell commands (default: num_cpus)
+      --concurrency <N>    Max parallel commands (default: num_cpus)
       --no-cache           Treat every task as a cache miss
   -q, --quiet              Suppress per-task stdout/stderr forwarding
+
+run options:
+      --fail-fast          Stop at the first failure
+      --timeout-scale <F>  Multiply every timeout by F
+      --json <FILE>        Also write the run's report to FILE
+      --tail <N>           Lines of a failed task's output to show (default 20)
 ```
+
+Exit status: 0 when every task succeeded, was cached or was skipped; 1
+when one failed or timed out; 130 when interrupted.
 
 Set `NEOMAKE_LOG=debug` to turn on `tracing` diagnostics.
 

@@ -69,10 +69,12 @@ impl Dag {
             dependents.entry(t.name.clone()).or_default();
         }
 
-        // Kahn's algorithm.
-        let mut queue: VecDeque<String> = in_degree
+        // Kahn's algorithm, seeded in declaration order so that tasks
+        // ready at the same time keep the order they are written in.
+        let mut queue: VecDeque<String> = tasks
             .iter()
-            .filter_map(|(n, &d)| if d == 0 { Some(n.clone()) } else { None })
+            .filter(|t| in_degree[&t.name] == 0)
+            .map(|t| t.name.clone())
             .collect();
         let mut topo = Vec::with_capacity(tasks.len());
         let mut remaining = in_degree.clone();
@@ -191,17 +193,20 @@ fn find_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn task(name: &str, deps: &[&str]) -> Task {
-        Task {
-            name: name.into(),
-            command: "true".into(),
-            deps: deps.iter().map(|s| s.to_string()).collect(),
-            inputs: vec![],
-            outputs: vec![],
-            env: BTreeMap::new(),
-        }
+        Task::new(name, "true").with_deps(deps)
+    }
+
+    #[test]
+    fn ready_tasks_keep_declaration_order() {
+        let tasks = vec![
+            task("zeta", &[]),
+            task("alpha", &[]),
+            task("mid", &["zeta"]),
+        ];
+        let dag = Dag::build(&tasks).unwrap();
+        assert_eq!(dag.topo_order(), &["zeta", "alpha", "mid"]);
     }
 
     #[test]

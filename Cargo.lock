@@ -889,6 +889,7 @@ dependencies = [
  "neomake-tomlx",
  "num_cpus",
  "pretty_assertions",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",
@@ -902,6 +903,8 @@ version = "0.1.0"
 dependencies = [
  "globset",
  "hex",
+ "indexmap",
+ "libc",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -909,6 +912,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "walkdir",
@@ -1636,11 +1640,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
 dependencies = [
+ "indexmap",
  "serde",
  "serde_spanned",
  "toml_datetime",

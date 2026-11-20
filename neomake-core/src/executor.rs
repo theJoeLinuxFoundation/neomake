@@ -6,37 +6,75 @@
 //! [`tokio::sync::watch`] channel is created per task; the sender is
 //! given to the task's own future, and a clone of the receiver is given
 //! to each of its dependents. A task starts by awaiting every
-//! dependency's channel to produce an outcome, inspects their statuses,
-//! and decides whether to run, skip (upstream failure), or cache-hit.
+//! dependency's channel to produce an outcome, and runs only if all of
+//! them succeeded (or were cached).
 //!
-//! A [`tokio::sync::Semaphore`] throttles how many tasks can be running
-//! a shell command simultaneously. The semaphore is acquired only for
-//! the actual command-execution critical section, so cache-hit tasks do
-//! not block parallelism.
+//! Before its command runs, a task takes, in order: the named locks it
+//! lists under `exclusive` (sorted, so two tasks can never wait on each
+//! other), then a slot of the [`Semaphore`] that caps how many commands
+//! run at once. An interactive task takes every slot, so it runs alone.
+//! Cache hits take neither.
 //!
-//! # Why not `rayon`?
+//! Hashing inputs and outputs reads files, which is done on tokio's
+//! blocking pool rather than on the threads that drive the run.
 //!
-//! Build tasks are overwhelmingly I/O-bound (spawning shells, waiting on
-//! child processes, reading/writing output files). `tokio::process`
-//! gives us streaming stdout/stderr handling and clean cancellation
-//! semantics; `rayon` would force us to block worker threads on child
-//! processes.
+//! # Stopping
+//!
+//! [`RunOptions::cancel`] stops the run: commands that are running are
+//! stopped (see [`crate::process`]) and become `Cancelled`, and tasks not
+//! yet started are skipped. `fail_fast` cancels it at the first failure.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::cache::Cache;
 use crate::dag::Dag;
 use crate::error::ExecError;
+use crate::process::{self, Invocation, Stream};
+use crate::rundir;
 use crate::shell;
 use crate::task::Task;
+
+/// Why a task did not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// A dependency did not succeed.
+    Upstream {
+        /// The dependency.
+        task: String,
+        /// Whether it failed (rather than being skipped itself).
+        failed: bool,
+    },
+    /// Its requirements are not met on this host.
+    Unmet(String),
+    /// Its configuration says to skip it.
+    Disabled(String),
+    /// The run was stopped before it started.
+    Stopped,
+}
+
+impl SkipReason {
+    /// The reason in words.
+    pub fn describe(&self) -> String {
+        match self {
+            SkipReason::Upstream { task, failed: true } => format!("upstream `{task}` failed"),
+            SkipReason::Upstream {
+                task,
+                failed: false,
+            } => format!("upstream `{task}` did not run"),
+            SkipReason::Unmet(why) => format!("requires: {why}"),
+            SkipReason::Disabled(why) => why.clone(),
+            SkipReason::Stopped => "the run was stopped".into(),
+        }
+    }
+}
 
 /// Status of a single task after the run completes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,16 +83,38 @@ pub enum TaskStatus {
     Success,
     /// Task was skipped because the cache already held a valid result.
     Cached,
-    /// Task's shell command returned a non-zero exit status or failed to spawn.
+    /// Task's command returned a non-zero exit status or failed to start.
     Failed,
-    /// Task did not run because an upstream dependency failed.
-    Skipped,
+    /// Task's command was stopped because its timeout passed.
+    TimedOut,
+    /// Task's command was stopped because the run was cancelled.
+    Cancelled,
+    /// Task did not run.
+    Skipped(SkipReason),
 }
 
 impl TaskStatus {
-    /// Returns `true` if the status blocks dependents from running.
+    /// Returns `true` if the status keeps dependents from running.
     pub fn is_blocking_failure(&self) -> bool {
-        matches!(self, Self::Failed | Self::Skipped)
+        !matches!(self, Self::Success | Self::Cached)
+    }
+
+    /// Returns `true` for a task that ran and did not succeed.
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed | Self::TimedOut)
+    }
+
+    /// A one-word name: `success`, `cached`, `failed`, `timed_out`,
+    /// `cancelled` or `skipped`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Cached => "cached",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::Skipped(_) => "skipped",
+        }
     }
 }
 
@@ -67,13 +127,48 @@ pub struct TaskOutcome {
     pub status: TaskStatus,
     /// Cache key derived for this task (hex SHA-256).
     pub cache_key: Option<String>,
-    /// Shell exit code, when the task actually ran.
+    /// Exit status of the last attempt, when the task ran (128 plus the
+    /// signal number for a command killed by a signal).
     pub exit_code: Option<i32>,
-    /// Wall-clock time between "queued" and "resolved". For cache hits
-    /// this is dominated by input hashing; for skipped tasks it is ~0.
+    /// Time spent running the command, over every attempt; for cache hits
+    /// the time spent checking the cache.
     pub duration: Duration,
     /// Human-readable error message, if any.
     pub error: Option<String>,
+    /// How many times the command was started.
+    pub attempts: u32,
+    /// When the first attempt started.
+    pub started_at: Option<SystemTime>,
+    /// The task's log file, if one was written.
+    pub log: Option<PathBuf>,
+    /// The last lines the task printed, kept for failed tasks.
+    pub tail: Vec<String>,
+    /// The task failed, but `allow_failure` makes that not count.
+    pub allowed_failure: bool,
+}
+
+impl TaskOutcome {
+    fn new(name: &str, status: TaskStatus) -> Self {
+        Self {
+            name: name.to_string(),
+            status,
+            cache_key: None,
+            exit_code: None,
+            duration: Duration::ZERO,
+            error: None,
+            attempts: 0,
+            started_at: None,
+            log: None,
+            tail: Vec::new(),
+            allowed_failure: false,
+        }
+    }
+
+    fn skipped(name: &str, reason: SkipReason) -> Self {
+        let mut o = Self::new(name, TaskStatus::Skipped(reason.clone()));
+        o.error = Some(reason.describe());
+        o
+    }
 }
 
 /// Aggregate report returned at the end of an executor run.
@@ -84,24 +179,37 @@ pub struct RunReport {
 }
 
 impl RunReport {
-    /// `true` if any task finished with a blocking failure.
+    /// `true` if a task failed or timed out, other than those allowed to.
     pub fn had_failure(&self) -> bool {
-        self.outcomes.iter().any(|o| o.status.is_blocking_failure())
+        self.outcomes
+            .iter()
+            .any(|o| o.status.is_failure() && !o.allowed_failure)
     }
 
     /// Look up the outcome for a specific task.
     pub fn get(&self, name: &str) -> Option<&TaskOutcome> {
         self.outcomes.iter().find(|o| o.name == name)
     }
+
+    /// How many outcomes have each status label.
+    pub fn counts(&self) -> BTreeMap<&'static str, usize> {
+        let mut counts = BTreeMap::new();
+        for o in &self.outcomes {
+            *counts.entry(o.status.label()).or_insert(0) += 1;
+        }
+        counts
+    }
 }
 
 /// Events emitted by the executor while a run is in progress.
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
-    /// Task started evaluating (dependencies done, acquiring cache/semaphore).
+    /// The task's command is starting.
     Started {
         /// Task name.
         task: String,
+        /// Which attempt this is, from 1.
+        attempt: u32,
     },
     /// Task resulted in a cache hit and will not run its command.
     Cached {
@@ -114,24 +222,37 @@ pub enum ExecutionEvent {
     Finished {
         /// Task name.
         task: String,
-        /// Elapsed wall-clock time.
+        /// Time spent running.
         duration: Duration,
+        /// How many attempts it took.
+        attempts: u32,
     },
-    /// Task failed to run (non-zero exit or spawn failure).
+    /// An attempt failed (non-zero exit, timeout or failure to start).
     Failed {
         /// Task name.
         task: String,
-        /// Exit code when one was produced.
+        /// Exit status when one was produced.
         exit_code: Option<i32>,
         /// Human-readable error message.
         message: String,
+        /// The attempt ran out of time.
+        timed_out: bool,
+        /// Another attempt follows.
+        retrying: bool,
+        /// The failure does not count (`allow_failure`).
+        allowed: bool,
     },
-    /// Task was skipped because an upstream dep failed.
+    /// The task's command was stopped because the run was cancelled.
+    Cancelled {
+        /// Task name.
+        task: String,
+    },
+    /// The task did not run.
     Skipped {
         /// Task name.
         task: String,
-        /// Upstream that caused the skip.
-        upstream: String,
+        /// Why.
+        reason: SkipReason,
     },
     /// A single line of the task's stdout.
     Stdout {
@@ -155,12 +276,26 @@ pub type Reporter = Arc<dyn Fn(ExecutionEvent) + Send + Sync>;
 /// Configuration knobs for [`run`].
 #[derive(Debug, Clone)]
 pub struct RunOptions {
-    /// Maximum number of tasks that may run their shell command concurrently.
+    /// Maximum number of tasks that may run their command concurrently.
     pub concurrency: usize,
-    /// Project root — commands are invoked with this as their working directory.
+    /// Project root — commands run here unless their `cwd` says otherwise.
     pub project_root: PathBuf,
     /// When `false`, every task is treated as a cache miss.
     pub use_cache: bool,
+    /// Stop the run at the first failure.
+    pub fail_fast: bool,
+    /// Every timeout is multiplied by this (for slow or fast hosts).
+    pub timeout_scale: f64,
+    /// The timeout of tasks that set none.
+    pub default_timeout: Option<Duration>,
+    /// The shell of tasks that set none (else the platform's).
+    pub default_shell: Option<Vec<String>>,
+    /// Where each task's log is written, if anywhere.
+    pub log_dir: Option<PathBuf>,
+    /// Cancelling this stops the run.
+    pub cancel: CancellationToken,
+    /// How many of a failed task's last lines its outcome keeps.
+    pub tail_lines: usize,
 }
 
 impl RunOptions {
@@ -170,6 +305,13 @@ impl RunOptions {
             project_root: project_root.into(),
             concurrency: concurrency.max(1),
             use_cache: true,
+            fail_fast: false,
+            timeout_scale: 1.0,
+            default_timeout: None,
+            default_shell: None,
+            log_dir: None,
+            cancel: CancellationToken::new(),
+            tail_lines: 40,
         }
     }
 }
@@ -185,12 +327,10 @@ pub fn select_tasks(dag: &Dag, targets: &[String]) -> Result<Vec<Task>, ExecErro
 
     for t in targets {
         if !all.contains_key(t.as_str()) {
-            return Err(ExecError::Io {
-                task: t.clone(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("no such task `{t}`"),
-                ),
+            let suggestion = closest(t, all.keys().copied());
+            return Err(ExecError::UnknownTask {
+                name: t.clone(),
+                suggestion,
             });
         }
     }
@@ -205,7 +345,6 @@ pub fn select_tasks(dag: &Dag, targets: &[String]) -> Result<Vec<Task>, ExecErro
             stack.push(d.clone());
         }
     }
-    // Preserve dag-declaration order for determinism.
     Ok(dag
         .tasks()
         .iter()
@@ -214,11 +353,42 @@ pub fn select_tasks(dag: &Dag, targets: &[String]) -> Result<Vec<Task>, ExecErro
         .collect())
 }
 
+/// The name in `names` closest to `wanted`, if one is close enough to be
+/// a likely misspelling.
+pub fn closest<'a>(wanted: &str, names: impl Iterator<Item = &'a str>) -> Option<String> {
+    names
+        .map(|n| (edit_distance(wanted, n), n))
+        .filter(|(d, n)| *d <= (n.len().max(wanted.len()) / 3).max(2))
+        .min()
+        .map(|(_, n)| n.to_string())
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != cb))
+                .min(prev[j + 1] + 1)
+                .min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// Shared state of one run.
+struct Context {
+    cache: Cache,
+    opts: RunOptions,
+    reporter: Reporter,
+    sem: Arc<Semaphore>,
+    locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+}
+
 /// Run `tasks` in parallel honoring their dependency order.
-///
-/// The ordering is enforced by per-task [`watch`] channels; cancellation
-/// of dependents on failure is enforced by dependents observing a
-/// `Failed`/`Skipped` outcome and transitioning to `Skipped` themselves.
 pub async fn run(
     tasks: &[Task],
     cache: &Cache,
@@ -226,17 +396,30 @@ pub async fn run(
     reporter: Option<Reporter>,
 ) -> Result<RunReport, ExecError> {
     // Sub-DAG just for `tasks` (so `deps_of` only includes selected tasks).
-    let dag = Dag::build(tasks).map_err(|e| ExecError::Io {
-        task: "<plan>".into(),
-        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
-    })?;
+    let dag = Dag::build(tasks).map_err(|e| ExecError::Plan(e.to_string()))?;
 
-    let sem = Arc::new(Semaphore::new(options.concurrency.max(1)));
-    let cache = Arc::new(cache.clone());
-    let opts = Arc::new(options.clone());
-    let reporter = reporter.unwrap_or_else(|| Arc::new(|_| {}));
+    let locks = tasks
+        .iter()
+        .flat_map(|t| t.exclusive.iter())
+        .map(|name| (name.clone(), Arc::new(tokio::sync::Mutex::new(()))))
+        .collect();
+    let ctx = Arc::new(Context {
+        cache: cache.clone(),
+        opts: RunOptions {
+            concurrency: options.concurrency.max(1),
+            ..options.clone()
+        },
+        reporter: reporter.unwrap_or_else(|| Arc::new(|_| {})),
+        sem: Arc::new(Semaphore::new(options.concurrency.max(1))),
+        locks,
+    });
+    if let Some(dir) = &ctx.opts.log_dir {
+        std::fs::create_dir_all(dir).map_err(|source| ExecError::Io {
+            task: "<logs>".into(),
+            source,
+        })?;
+    }
 
-    // One watch channel per task.
     let mut senders: HashMap<String, watch::Sender<Option<TaskOutcome>>> = HashMap::new();
     let mut receivers: HashMap<String, watch::Receiver<Option<TaskOutcome>>> = HashMap::new();
     for name in dag.topo_order() {
@@ -253,15 +436,12 @@ pub async fn run(
             .map(|d| receivers[d].clone())
             .collect();
         let my_sender = senders.remove(&task.name).expect("sender prepared");
-        let sem = Arc::clone(&sem);
-        let cache = Arc::clone(&cache);
-        let opts = Arc::clone(&opts);
-        let reporter = Arc::clone(&reporter);
-
+        let ctx = Arc::clone(&ctx);
         join_set.spawn(async move {
-            let outcome = run_single(task, dep_receivers, sem, cache, opts, reporter).await;
-            // Publish for dependents. Ignoring the send error is fine:
-            // dependents that dropped their receiver cannot be waiting.
+            let outcome = run_single(task, dep_receivers, &ctx).await;
+            if ctx.opts.fail_fast && outcome.status.is_failure() && !outcome.allowed_failure {
+                ctx.opts.cancel.cancel();
+            }
             let _ = my_sender.send(Some(outcome.clone()));
             outcome
         });
@@ -269,11 +449,11 @@ pub async fn run(
 
     let mut outcomes: HashMap<String, TaskOutcome> = HashMap::new();
     while let Some(joined) = join_set.join_next().await {
-        let outcome = joined.map_err(|e| ExecError::Io {
-            task: "<runtime>".into(),
-            source: std::io::Error::other(e.to_string()),
-        })?;
+        let outcome = joined.map_err(|e| ExecError::Plan(format!("a task panicked: {e}")))?;
         outcomes.insert(outcome.name.clone(), outcome);
+    }
+    if let Err(e) = ctx.cache.flush() {
+        tracing::warn!(error = %e, "could not save the remembered input hashes");
     }
 
     let ordered = dag
@@ -281,262 +461,367 @@ pub async fn run(
         .iter()
         .filter_map(|n| outcomes.remove(n))
         .collect();
-
     Ok(RunReport { outcomes: ordered })
 }
 
 async fn run_single(
     task: Task,
     mut dep_receivers: Vec<watch::Receiver<Option<TaskOutcome>>>,
-    sem: Arc<Semaphore>,
-    cache: Arc<Cache>,
-    opts: Arc<RunOptions>,
-    reporter: Reporter,
+    ctx: &Context,
 ) -> TaskOutcome {
-    let started = Instant::now();
+    let reporter = &ctx.reporter;
+    let skip = |reason: SkipReason| {
+        reporter(ExecutionEvent::Skipped {
+            task: task.name.clone(),
+            reason: reason.clone(),
+        });
+        TaskOutcome::skipped(&task.name, reason)
+    };
 
-    // Wait for every dep. Collect their cache keys (for our own key
-    // derivation) and detect upstream failures.
+    // Wait for every dep, collecting their cache keys for our own.
     let mut dep_keys: Vec<String> = Vec::with_capacity(dep_receivers.len());
-    let mut blocking_upstream: Option<String> = None;
     for rx in dep_receivers.iter_mut() {
-        // Fast path: the value may already be present.
-        if rx.borrow().is_none() {
-            // Await change. If the sender was dropped without sending,
-            // treat as an internal failure.
-            if rx.changed().await.is_err() {
-                return TaskOutcome {
-                    name: task.name.clone(),
-                    status: TaskStatus::Skipped,
-                    cache_key: None,
-                    exit_code: None,
-                    duration: started.elapsed(),
-                    error: Some("upstream dep channel closed".into()),
-                };
+        let outcome = match rx.wait_for(Option::is_some).await {
+            Ok(v) => v.clone().expect("waited for Some"),
+            Err(_) => {
+                return skip(SkipReason::Upstream {
+                    task: "<unknown>".into(),
+                    failed: true,
+                })
             }
-        }
-        let outcome = rx
-            .borrow()
-            .clone()
-            .expect("dep channel yielded None after change");
+        };
         if outcome.status.is_blocking_failure() {
-            blocking_upstream = Some(outcome.name.clone());
-            break;
+            return skip(SkipReason::Upstream {
+                failed: outcome.status.is_failure() || outcome.status == TaskStatus::Cancelled,
+                task: outcome.name,
+            });
         }
         if let Some(k) = outcome.cache_key {
             dep_keys.push(k);
         }
     }
 
-    if let Some(upstream) = blocking_upstream {
-        reporter(ExecutionEvent::Skipped {
-            task: task.name.clone(),
-            upstream: upstream.clone(),
-        });
-        return TaskOutcome {
-            name: task.name.clone(),
-            status: TaskStatus::Skipped,
-            cache_key: None,
-            exit_code: None,
-            duration: started.elapsed(),
-            error: Some(format!("upstream `{upstream}` failed")),
-        };
+    if ctx.opts.cancel.is_cancelled() {
+        return skip(SkipReason::Stopped);
+    }
+    if let Some(reason) = &task.skip {
+        return skip(SkipReason::Disabled(reason.clone()));
+    }
+    if let Some(reason) = task.requires.unmet(&ctx.opts.project_root) {
+        return skip(SkipReason::Unmet(reason));
     }
 
-    // Compute the cache key. If this fails (e.g. broken glob or missing
-    // input file), treat it as a task failure with a clear message.
-    let cache_key = match cache.compute_key(&task, &dep_keys) {
-        Ok(k) => k,
-        Err(e) => {
-            let msg = format!("cache key derivation failed: {e}");
-            reporter(ExecutionEvent::Failed {
-                task: task.name.clone(),
-                exit_code: None,
-                message: msg.clone(),
-            });
-            return TaskOutcome {
-                name: task.name.clone(),
-                status: TaskStatus::Failed,
-                cache_key: None,
-                exit_code: None,
-                duration: started.elapsed(),
-                error: Some(msg),
-            };
+    let checking = Instant::now();
+    let cache_key = {
+        let cache = ctx.cache.clone();
+        let t = task.clone();
+        match tokio::task::spawn_blocking(move || cache.compute_key(&t, &dep_keys)).await {
+            Ok(Ok(k)) => k,
+            Ok(Err(e)) => {
+                return fail_early(&task, ctx, format!("cache key derivation failed: {e}"))
+            }
+            Err(e) => return fail_early(&task, ctx, format!("cache key derivation panicked: {e}")),
         }
     };
 
-    // Cache hit?
-    if opts.use_cache {
-        match cache.lookup(&cache_key) {
-            Ok(Some(_hit)) => {
+    let caching = ctx.opts.use_cache && task.cache;
+    if caching {
+        let cache = ctx.cache.clone();
+        let key = cache_key.clone();
+        match tokio::task::spawn_blocking(move || cache.lookup(&key)).await {
+            Ok(Ok(Some(_))) => {
                 reporter(ExecutionEvent::Cached {
                     task: task.name.clone(),
                     key: cache_key.clone(),
                 });
-                return TaskOutcome {
-                    name: task.name.clone(),
-                    status: TaskStatus::Cached,
-                    cache_key: Some(cache_key),
-                    exit_code: Some(0),
-                    duration: started.elapsed(),
-                    error: None,
-                };
+                let mut o = TaskOutcome::new(&task.name, TaskStatus::Cached);
+                o.cache_key = Some(cache_key);
+                o.exit_code = Some(0);
+                o.duration = checking.elapsed();
+                return o;
             }
-            Ok(None) => {}
-            Err(e) => {
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
                 tracing::warn!(task = %task.name, error = %e, "cache lookup failed; treating as miss");
+            }
+            Err(e) => {
+                tracing::warn!(task = %task.name, error = %e, "cache lookup panicked; treating as miss");
             }
         }
     }
 
-    reporter(ExecutionEvent::Started {
-        task: task.name.clone(),
-    });
+    // Locks, then a concurrency slot (every slot, for an interactive task).
+    let mut names: Vec<&String> = task.exclusive.iter().collect();
+    names.sort();
+    names.dedup();
+    let mut _guards = Vec::with_capacity(names.len());
+    for name in names {
+        let lock = Arc::clone(&ctx.locks[name]);
+        tokio::select! {
+            guard = lock.lock_owned() => _guards.push(guard),
+            _ = ctx.opts.cancel.cancelled() => return skip(SkipReason::Stopped),
+        }
+    }
+    let slots = if task.interactive {
+        ctx.opts.concurrency as u32
+    } else {
+        1
+    };
+    let _permit = tokio::select! {
+        permit = Arc::clone(&ctx.sem).acquire_many_owned(slots) => match permit {
+            Ok(p) => p,
+            Err(_) => return fail_early(&task, ctx, "the scheduler shut down".into()),
+        },
+        _ = ctx.opts.cancel.cancelled() => return skip(SkipReason::Stopped),
+    };
 
-    // Acquire the concurrency slot only for the duration of the shell command.
-    let _permit = match sem.acquire().await {
-        Ok(p) => p,
-        Err(_) => {
-            let msg = "semaphore closed".to_string();
-            reporter(ExecutionEvent::Failed {
-                task: task.name.clone(),
-                exit_code: None,
-                message: msg.clone(),
-            });
-            return TaskOutcome {
-                name: task.name.clone(),
-                status: TaskStatus::Failed,
-                cache_key: Some(cache_key),
-                exit_code: None,
-                duration: started.elapsed(),
-                error: Some(msg),
-            };
+    let mut outcome = execute(&task, ctx).await;
+    outcome.cache_key = Some(cache_key.clone());
+
+    if outcome.status == TaskStatus::Success && caching {
+        let cache = ctx.cache.clone();
+        let t = task.clone();
+        let key = cache_key;
+        match tokio::task::spawn_blocking(move || cache.store(&t, &key, 0)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(task = %task.name, error = %e, "cache store failed"),
+            Err(e) => tracing::warn!(task = %task.name, error = %e, "cache store panicked"),
+        }
+    }
+    outcome
+}
+
+fn fail_early(task: &Task, ctx: &Context, message: String) -> TaskOutcome {
+    (ctx.reporter)(ExecutionEvent::Failed {
+        task: task.name.clone(),
+        exit_code: None,
+        message: message.clone(),
+        timed_out: false,
+        retrying: false,
+        allowed: task.allow_failure,
+    });
+    let mut o = TaskOutcome::new(&task.name, TaskStatus::Failed);
+    o.error = Some(message);
+    o.allowed_failure = task.allow_failure;
+    o
+}
+
+/// Run the task's command, as many times as its retries allow.
+async fn execute(task: &Task, ctx: &Context) -> TaskOutcome {
+    let reporter = &ctx.reporter;
+    let log_path = ctx
+        .opts
+        .log_dir
+        .as_ref()
+        .map(|dir| dir.join(format!("{}.log", rundir::file_name_for(&task.name))));
+    let log = log_path
+        .as_ref()
+        .and_then(|p| std::fs::File::create(p).ok())
+        .map(|f| Arc::new(Mutex::new(std::io::BufWriter::new(f))));
+    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(ctx.opts.tail_lines)));
+    let note = |line: String| {
+        if let Some(log) = &log {
+            let mut w = log.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = writeln!(w, "{line}");
         }
     };
 
-    let span = tracing::info_span!("task", name = %task.name);
-    let _enter = span.enter();
+    let timeout = task
+        .timeout
+        .or(ctx.opts.default_timeout)
+        .map(|t| t.mul_f64(ctx.opts.timeout_scale.max(0.0)));
+    let invocation = invocation_for(task, &ctx.opts);
+    let started_at = SystemTime::now();
+    let started = Instant::now();
+    let max_attempts = task.retries + 1;
+    let mut outcome = TaskOutcome::new(&task.name, TaskStatus::Failed);
+    outcome.started_at = Some(started_at);
+    outcome.log = log_path.clone();
+    outcome.allowed_failure = task.allow_failure;
 
-    let run_result = run_command(&task, &opts.project_root, &reporter).await;
-    drop(_enter);
+    for attempt in 1..=max_attempts {
+        outcome.attempts = attempt;
+        if attempt > 1 {
+            note(format!("--- attempt {attempt} of {max_attempts} ---"));
+        }
+        reporter(ExecutionEvent::Started {
+            task: task.name.clone(),
+            attempt,
+        });
 
-    match run_result {
-        Ok(0) => {
-            if opts.use_cache {
-                if let Err(e) = cache.store(&task, &cache_key, 0) {
-                    tracing::warn!(task = %task.name, error = %e, "cache store failed");
+        let invocation = match &invocation {
+            Ok(inv) => inv,
+            Err(message) => {
+                note(message.clone());
+                outcome.error = Some(message.clone());
+                reporter(ExecutionEvent::Failed {
+                    task: task.name.clone(),
+                    exit_code: None,
+                    message: message.clone(),
+                    timed_out: false,
+                    retrying: false,
+                    allowed: task.allow_failure,
+                });
+                break;
+            }
+        };
+
+        let name = task.name.clone();
+        let result = process::run(invocation, timeout, &ctx.opts.cancel, |stream, line| {
+            note(line.clone());
+            {
+                let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+                if t.len() == ctx.opts.tail_lines {
+                    t.pop_front();
+                }
+                if ctx.opts.tail_lines > 0 {
+                    t.push_back(line.clone());
                 }
             }
-            let duration = started.elapsed();
-            reporter(ExecutionEvent::Finished {
-                task: task.name.clone(),
-                duration,
+            reporter(match stream {
+                Stream::Stdout => ExecutionEvent::Stdout {
+                    task: name.clone(),
+                    line,
+                },
+                Stream::Stderr => ExecutionEvent::Stderr {
+                    task: name.clone(),
+                    line,
+                },
             });
-            TaskOutcome {
-                name: task.name,
-                status: TaskStatus::Success,
-                cache_key: Some(cache_key),
-                exit_code: Some(0),
-                duration,
-                error: None,
+        })
+        .await;
+
+        let retrying = attempt < max_attempts && !ctx.opts.cancel.is_cancelled();
+        match result {
+            Ok(exit) if exit.success() => {
+                outcome.status = TaskStatus::Success;
+                outcome.exit_code = Some(0);
+                outcome.error = None;
+                break;
+            }
+            Ok(exit) if exit.cancelled => {
+                outcome.status = TaskStatus::Cancelled;
+                outcome.exit_code = Some(exit.status());
+                outcome.error = Some("stopped: the run was cancelled".into());
+                note("--- stopped: the run was cancelled ---".into());
+                reporter(ExecutionEvent::Cancelled {
+                    task: task.name.clone(),
+                });
+                break;
+            }
+            Ok(exit) => {
+                let message = if exit.timed_out {
+                    format!(
+                        "timed out after {}",
+                        crate::duration::human(timeout.unwrap_or_default())
+                    )
+                } else {
+                    exit.describe()
+                };
+                note(format!("--- {message} ---"));
+                outcome.status = if exit.timed_out {
+                    TaskStatus::TimedOut
+                } else {
+                    TaskStatus::Failed
+                };
+                outcome.exit_code = Some(exit.status());
+                outcome.error = Some(message.clone());
+                reporter(ExecutionEvent::Failed {
+                    task: task.name.clone(),
+                    exit_code: Some(exit.status()),
+                    message,
+                    timed_out: exit.timed_out,
+                    retrying,
+                    allowed: task.allow_failure,
+                });
+            }
+            Err(e) => {
+                let message = format!("could not start `{}`: {e}", invocation.program);
+                note(message.clone());
+                outcome.status = TaskStatus::Failed;
+                outcome.exit_code = None;
+                outcome.error = Some(message.clone());
+                reporter(ExecutionEvent::Failed {
+                    task: task.name.clone(),
+                    exit_code: None,
+                    message,
+                    timed_out: false,
+                    retrying,
+                    allowed: task.allow_failure,
+                });
             }
         }
-        Ok(code) => {
-            let msg = format!("exit code {code}");
-            reporter(ExecutionEvent::Failed {
-                task: task.name.clone(),
-                exit_code: Some(code),
-                message: msg.clone(),
-            });
-            TaskOutcome {
-                name: task.name,
-                status: TaskStatus::Failed,
-                cache_key: Some(cache_key),
-                exit_code: Some(code),
-                duration: started.elapsed(),
-                error: Some(msg),
-            }
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            reporter(ExecutionEvent::Failed {
-                task: task.name.clone(),
-                exit_code: None,
-                message: msg.clone(),
-            });
-            TaskOutcome {
-                name: task.name,
-                status: TaskStatus::Failed,
-                cache_key: Some(cache_key),
-                exit_code: None,
-                duration: started.elapsed(),
-                error: Some(msg),
-            }
+        if !retrying {
+            break;
         }
     }
+
+    outcome.duration = started.elapsed();
+    if let Some(log) = &log {
+        let _ = log.lock().unwrap_or_else(|e| e.into_inner()).flush();
+    }
+    if outcome.status != TaskStatus::Success {
+        outcome.tail = tail
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+    } else {
+        reporter(ExecutionEvent::Finished {
+            task: task.name.clone(),
+            duration: outcome.duration,
+            attempts: outcome.attempts,
+        });
+    }
+    outcome
 }
 
-async fn run_command(task: &Task, cwd: &Path, reporter: &Reporter) -> Result<i32, std::io::Error> {
-    use tokio::process::Command;
-    let invocation = shell::resolve();
-    let mut cmd = Command::new(&invocation.program);
-    cmd.args(&invocation.args)
-        .arg(&task.command)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in &task.env {
-        cmd.env(k, v);
+/// How `task` is started, or why it cannot be.
+fn invocation_for(task: &Task, opts: &RunOptions) -> Result<Invocation, String> {
+    let argv: Vec<String> = match task.shell.as_ref().or(opts.default_shell.as_ref()) {
+        Some(argv) => argv.clone(),
+        None => {
+            let s = shell::resolve();
+            std::iter::once(s.program).chain(s.args).collect()
+        }
+    };
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| "the shell is empty".to_string())?;
+    let cwd = match &task.cwd {
+        Some(dir) => opts.project_root.join(dir),
+        None => opts.project_root.clone(),
+    };
+    if !cwd.is_dir() {
+        return Err(format!(
+            "the working directory {} does not exist",
+            display_rel(&cwd)
+        ));
     }
-    let mut child = cmd.spawn()?;
+    let mut args = args.to_vec();
+    args.push(task.command.clone());
+    Ok(Invocation {
+        program: program.clone(),
+        args,
+        cwd,
+        env: task.env.clone(),
+        env_clear: task.env_clear,
+        interactive: task.interactive,
+    })
+}
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let stdout_task = stdout.map(|s| {
-        let name = task.name.clone();
-        let reporter = Arc::clone(reporter);
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(s).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                reporter(ExecutionEvent::Stdout {
-                    task: name.clone(),
-                    line,
-                });
-            }
-        })
-    });
-    let stderr_task = stderr.map(|s| {
-        let name = task.name.clone();
-        let reporter = Arc::clone(reporter);
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(s).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                reporter(ExecutionEvent::Stderr {
-                    task: name.clone(),
-                    line,
-                });
-            }
-        })
-    });
-
-    let status = child.wait().await?;
-
-    if let Some(h) = stdout_task {
-        let _ = h.await;
-    }
-    if let Some(h) = stderr_task {
-        let _ = h.await;
-    }
-
-    Ok(status.code().unwrap_or(-1))
+fn display_rel(path: &Path) -> String {
+    path.strip_prefix("./")
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
 
     // Cross-platform test command helpers. The default shell is `sh -c`
     // on Unix and PowerShell on Windows, so test commands must be
@@ -574,14 +859,7 @@ mod tests {
     }
 
     fn mk(name: &str, cmd: &str, deps: &[&str]) -> Task {
-        Task {
-            name: name.into(),
-            command: cmd.into(),
-            deps: deps.iter().map(|s| s.to_string()).collect(),
-            inputs: vec![],
-            outputs: vec![],
-            env: BTreeMap::new(),
-        }
+        Task::new(name, cmd).with_deps(deps)
     }
 
     fn events_collector() -> (Reporter, Arc<Mutex<Vec<ExecutionEvent>>>) {
@@ -593,16 +871,17 @@ mod tests {
         (r, store)
     }
 
+    async fn run_in(tmp: &Path, tasks: &[Task], opts: &RunOptions) -> RunReport {
+        let cache = Cache::open(tmp).unwrap();
+        run(tasks, &cache, opts, None).await.unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn runs_independent_tasks_concurrently() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = Cache::open(tmp.path()).unwrap();
         // PowerShell's per-invocation startup is ~0.5–1s on a fresh CI
-        // runner, so we need (a) a sleep large enough that the signal
-        // dominates spawn noise and (b) a threshold sized as
-        // `sleep + spawn_budget` rather than a tight multiple of the
-        // sleep, so parallel runs sit well under it while serial runs
-        // (which pay startup twice) sit comfortably above.
+        // runner, so the sleep must dominate spawn noise and the
+        // threshold is sized as `sleep + spawn_budget`.
         let (sleep_ms, threshold_ms): (u64, u64) = if cfg!(windows) {
             (2000, 4500)
         } else {
@@ -614,7 +893,7 @@ mod tests {
         ];
         let opts = RunOptions::new(tmp.path(), 4);
         let started = Instant::now();
-        let report = run(&tasks, &cache, &opts, None).await.unwrap();
+        let report = run_in(tmp.path(), &tasks, &opts).await;
         let elapsed = started.elapsed();
         assert!(!report.had_failure());
         assert!(
@@ -626,15 +905,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failure_skips_dependents() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = Cache::open(tmp.path()).unwrap();
         let tasks = vec![
             mk("a", &fail_cmd(), &[]),
             mk("b", "echo should-not-run", &["a"]),
         ];
-        let opts = RunOptions::new(tmp.path(), 2);
-        let report = run(&tasks, &cache, &opts, None).await.unwrap();
+        let report = run_in(tmp.path(), &tasks, &RunOptions::new(tmp.path(), 2)).await;
         assert_eq!(report.get("a").unwrap().status, TaskStatus::Failed);
-        assert_eq!(report.get("b").unwrap().status, TaskStatus::Skipped);
+        assert_eq!(
+            report.get("b").unwrap().status,
+            TaskStatus::Skipped(SkipReason::Upstream {
+                task: "a".into(),
+                failed: true
+            })
+        );
+        assert!(report.had_failure());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -642,16 +926,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path()).unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
-        // Intentionally write deterministic output so the cache can verify it.
-        let cmd = write_cmd("out.txt", "hi");
-        let task = Task {
-            name: "t".into(),
-            command: cmd,
-            deps: vec![],
-            inputs: vec![],
-            outputs: vec!["out.txt".into()],
-            env: BTreeMap::new(),
-        };
+        let mut task = Task::new("t", write_cmd("out.txt", "hi"));
+        task.outputs = vec!["out.txt".into()];
         let opts = RunOptions::new(tmp.path(), 1);
 
         let c = Arc::clone(&counter);
@@ -678,5 +954,176 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, ExecutionEvent::Cached { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tasks_that_do_not_cache_always_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = Task::new("t", write_cmd("out.txt", "hi"));
+        task.outputs = vec!["out.txt".into()];
+        task.cache = false;
+        let opts = RunOptions::new(tmp.path(), 1);
+        run_in(tmp.path(), std::slice::from_ref(&task), &opts).await;
+        let r2 = run_in(tmp.path(), &[task], &opts).await;
+        assert_eq!(r2.get("t").unwrap().status, TaskStatus::Success);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skips_for_unmet_requirements_and_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut needs = mk("needs", "echo x", &[]);
+        needs.requires.commands = vec!["no-such-program-x9".into()];
+        let after = mk("after", "echo y", &["needs"]);
+        let mut off = mk("off", "echo z", &[]);
+        off.skip = Some("not on this host".into());
+        let report = run_in(
+            tmp.path(),
+            &[needs, after, off],
+            &RunOptions::new(tmp.path(), 2),
+        )
+        .await;
+        assert_eq!(
+            report.get("needs").unwrap().status,
+            TaskStatus::Skipped(SkipReason::Unmet("no-such-program-x9 not found".into()))
+        );
+        assert_eq!(
+            report.get("after").unwrap().status,
+            TaskStatus::Skipped(SkipReason::Upstream {
+                task: "needs".into(),
+                failed: false
+            })
+        );
+        assert_eq!(
+            report.get("off").unwrap().status,
+            TaskStatus::Skipped(SkipReason::Disabled("not on this host".into()))
+        );
+        assert!(!report.had_failure(), "skipping is not failing");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeouts_retries_and_allowed_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut slow = mk("slow", "sleep 30", &[]);
+        slow.timeout = Some(Duration::from_millis(200));
+        // Fails twice, then succeeds.
+        let mut flaky = mk(
+            "flaky",
+            "n=$(cat count 2>/dev/null || echo 0); echo $((n+1)) > count; [ $n -ge 2 ]",
+            &[],
+        );
+        flaky.retries = 2;
+        let mut allowed = mk("allowed", "exit 4", &[]);
+        allowed.allow_failure = true;
+        let report = run_in(
+            tmp.path(),
+            &[slow, flaky, allowed],
+            &RunOptions::new(tmp.path(), 3),
+        )
+        .await;
+        let slow = report.get("slow").unwrap();
+        assert_eq!(slow.status, TaskStatus::TimedOut);
+        assert!(slow.duration < Duration::from_secs(5));
+        let flaky = report.get("flaky").unwrap();
+        assert_eq!(flaky.status, TaskStatus::Success);
+        assert_eq!(flaky.attempts, 3);
+        let allowed = report.get("allowed").unwrap();
+        assert_eq!(allowed.status, TaskStatus::Failed);
+        assert_eq!(allowed.exit_code, Some(4));
+        assert!(allowed.allowed_failure);
+        // Only the timeout counts against the run.
+        assert!(report.had_failure());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_scale_stretches_timeouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut t = mk("t", "sleep 0.3", &[]);
+        t.timeout = Some(Duration::from_millis(100));
+        let mut opts = RunOptions::new(tmp.path(), 1);
+        opts.timeout_scale = 10.0;
+        let report = run_in(tmp.path(), &[t], &opts).await;
+        assert_eq!(report.get("t").unwrap().status, TaskStatus::Success);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fail_fast_stops_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fails = mk("fails", "sleep 0.1; false", &[]);
+        let long = mk("long", "sleep 30", &[]);
+        let later = mk("later", "echo late", &["long"]);
+        let mut opts = RunOptions::new(tmp.path(), 4);
+        opts.fail_fast = true;
+        let started = Instant::now();
+        let report = run_in(tmp.path(), &[fails, long, later], &opts).await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(report.get("fails").unwrap().status, TaskStatus::Failed);
+        assert_eq!(report.get("long").unwrap().status, TaskStatus::Cancelled);
+        assert!(matches!(
+            report.get("later").unwrap().status,
+            TaskStatus::Skipped(SkipReason::Upstream { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exclusive_tasks_do_not_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script =
+            "if [ -e held ]; then echo overlap >> errors; fi; touch held; sleep 0.2; rm held";
+        let mut tasks = Vec::new();
+        for name in ["a", "b", "c"] {
+            let mut t = mk(name, script, &[]);
+            t.exclusive = vec!["port-8642".into()];
+            tasks.push(t);
+        }
+        let report = run_in(tmp.path(), &tasks, &RunOptions::new(tmp.path(), 3)).await;
+        assert!(!report.had_failure());
+        assert!(
+            !tmp.path().join("errors").exists(),
+            "two holders of one lock overlapped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writes_logs_and_keeps_the_tail_of_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut opts = RunOptions::new(tmp.path(), 1);
+        opts.log_dir = Some(tmp.path().join("logs"));
+        opts.tail_lines = 2;
+        let mut t = mk("t[x=1]", "echo one; echo two; echo three >&2; exit 2", &[]);
+        t.cwd = Some("sub".into());
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        let report = run_in(tmp.path(), &[t], &opts).await;
+        let o = report.get("t[x=1]").unwrap();
+        assert_eq!(o.tail.len(), 2);
+        assert_eq!(o.tail[1], "three");
+        let log = std::fs::read_to_string(o.log.as_ref().unwrap()).unwrap();
+        assert!(log.contains("one\n"), "{log}");
+        assert!(log.contains("--- exit code 2 ---"), "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_working_directory_fails_the_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut t = mk("t", "echo x", &[]);
+        t.cwd = Some("nowhere".into());
+        let report = run_in(tmp.path(), &[t], &RunOptions::new(tmp.path(), 1)).await;
+        let o = report.get("t").unwrap();
+        assert_eq!(o.status, TaskStatus::Failed);
+        assert!(o.error.as_ref().unwrap().contains("does not exist"));
+    }
+
+    #[test]
+    fn suggests_close_names() {
+        let names = ["build", "test", "deploy"];
+        assert_eq!(
+            closest("biuld", names.iter().copied()),
+            Some("build".into())
+        );
+        assert_eq!(closest("zzzzzz", names.iter().copied()), None);
     }
 }

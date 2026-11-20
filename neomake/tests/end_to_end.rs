@@ -216,3 +216,108 @@ deps = ["bad"]
     assert!(s.contains("[FAILED"), "expected a FAILED tag; got: {s}");
     assert!(s.contains("[SKIPPED"), "expected a SKIPPED tag; got: {s}");
 }
+
+fn run_in(dir: &std::path::Path, args: &[&str]) -> (std::process::ExitStatus, String, String) {
+    let out = Command::new(neomake_bin())
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn neomake");
+    (
+        out.status,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn runs_keep_logs_and_a_report_in_the_state_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = r#"
+[settings]
+state_dir = "build/state"
+
+[tasks.speak]
+command = "echo spoken"
+cache = false
+
+[tasks.missing]
+command = "echo never"
+requires = { commands = ["no-such-program-x9"] }
+
+[tasks.off]
+command = "echo never"
+skip = "switched off"
+"#;
+    fs::write(tmp.path().join("neomake.toml"), cfg).unwrap();
+    let (status, stdout, stderr) = run_in(tmp.path(), &["run"]);
+    assert!(status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("requires: no-such-program-x9 not found"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("switched off"), "{stdout}");
+
+    let runs = tmp.path().join("build/state/runs");
+    // A symlink on Unix, a file naming the run elsewhere.
+    let latest = match fs::read_link(runs.join("latest")) {
+        Ok(id) => runs.join(id),
+        Err(_) => runs.join(fs::read_to_string(runs.join("latest")).unwrap().trim()),
+    };
+    let report = fs::read_to_string(latest.join("report.json")).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["success"], true);
+    let tasks = report["tasks"].as_array().unwrap();
+    let speak = tasks.iter().find(|t| t["name"] == "speak").unwrap();
+    assert_eq!(speak["status"], "success");
+    assert_eq!(speak["defined_at"], "neomake.toml:5");
+    let log = tmp.path().join(speak["log"].as_str().unwrap());
+    assert!(fs::read_to_string(log).unwrap().contains("spoken"));
+    let missing = tasks.iter().find(|t| t["name"] == "missing").unwrap();
+    assert_eq!(missing["status"], "skipped");
+    assert!(
+        !tmp.path().join(".neomake").exists(),
+        "the state directory moved"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn timeouts_and_fail_fast_are_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = r#"
+[tasks.slow]
+command = "sleep 30"
+timeout = "300ms"
+
+[tasks.long]
+command = "sleep 30"
+"#;
+    fs::write(tmp.path().join("neomake.toml"), cfg).unwrap();
+    let started = std::time::Instant::now();
+    let (status, stdout, _) = run_in(tmp.path(), &["run", "--fail-fast", "--json", "out.json"]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    assert_eq!(status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("[TIMEOUT] slow  timed out after 300ms"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[STOPPED] long"), "{stdout}");
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join("out.json")).unwrap()).unwrap();
+    assert_eq!(report["summary"]["timed_out"], 1);
+    assert_eq!(report["summary"]["cancelled"], 1);
+}
+
+#[test]
+fn unknown_tasks_are_suggested() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_basic_config(tmp.path());
+    let (status, _, stderr) = run_in(tmp.path(), &["run", "cc"]);
+    assert!(!status.success());
+    assert!(
+        stderr.contains("no task named `cc` (did you mean `c`?)"),
+        "{stderr}"
+    );
+}
