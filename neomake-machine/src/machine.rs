@@ -18,10 +18,13 @@
 //! terminal's echo of the typed line does not match either (the first
 //! marker is followed there by `;`, the second by `$?`). A command that
 //! spans lines, is long, or holds a `#` (which would comment out the end
-//! marker) is first written to a file in `/tmp` and then sourced, so the
-//! functions and variables it defines stay in the shell until the next
-//! boot. Files are written the same way: base64, a few hundred
-//! characters per line, decoded in the machine.
+//! marker) is first written to a file in `/tmp` and then evaluated, so
+//! the functions and variables it defines stay in the shell until the
+//! next boot. It is read with `eval "$(cat FILE)"` rather than sourced: to
+//! the shell that is text typed at its prompt, which a system that runs
+//! only sealed scripts (joe Linux, enforcing) allows, where it refuses to
+//! source a file nobody sealed. Files are written the same way: base64, a
+//! few hundred characters per line, decoded in the machine.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -502,7 +505,7 @@ impl Machine {
             let path = format!("/tmp/.neomake-{n}.sh");
             self.write_file(&path, command.as_bytes(), remaining(deadline))
                 .await?;
-            let wrapped = format!(". {path}; __nm=$?; rm -f {path}; (exit $__nm)");
+            let wrapped = format!("eval \"$(cat {path})\"; __nm=$?; rm -f {path}; (exit $__nm)");
             return self.run_line(&wrapped, remaining(deadline)).await;
         }
         self.run_line(command, timeout).await

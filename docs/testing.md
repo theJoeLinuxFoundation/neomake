@@ -386,9 +386,11 @@ machine runs. The rest drive the machine:
 
 A command runs in the console's shell, which keeps what it defines until
 the next boot. A command that spans lines, is long, or holds a `#` is
-written to a file in the machine's `/tmp` and sourced, so a multi-line
-`run` can define shell functions for later steps. A command must not
-`exit` the shell, which would log the console out. Output on a serial
+written to a file in the machine's `/tmp` and evaluated there as if it
+had been typed (`eval "$(cat FILE)"`, which a system that refuses to
+source unsealed scripts still allows), so a multi-line `run` can define
+shell functions for later steps. A command must not `exit` the shell,
+which would log the console out, nor `return` outside a function. Output on a serial
 console is one stream, so a guest command's checks see stdout and stderr
 together.
 
