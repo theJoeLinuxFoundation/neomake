@@ -524,7 +524,10 @@ fn tokio_runtime() -> Result<tokio::runtime::Runtime> {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_env("NEOMAKE_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
+    // rustls warns of every client that names an IP address in SNI, as
+    // dave's does; that is not the run's business.
+    let filter = EnvFilter::try_from_env("NEOMAKE_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("warn,rustls=error"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
