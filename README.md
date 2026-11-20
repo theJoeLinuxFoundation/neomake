@@ -60,7 +60,7 @@ from this repo and run it against the caller’s checkout:
 ```yaml
 jobs:
   ci:
-    uses: sinisterMage/neomake/.github/workflows/reusable-neomake.yml@main
+    uses: theJoeLinuxFoundation/neomake/.github/workflows/reusable-neomake.yml@main
     with:
       neomake-ref: main
       config-path: neomake.toml
@@ -187,7 +187,7 @@ a complete example.
   a cycle is detected, an iterative DFS recovers the concrete cycle
   path (e.g. `a -> b -> c -> a`) and reports it.
 - **Cache keys** are SHA-256 over a versioned canonical byte layout
-  (`neomake-cache-v1`) built from the command, env, sorted input file
+  (`neomake-cache-v2`) built from the command, env, sorted input file
   hashes, and upstream dep keys. See `neomake-core/src/cache.rs` for the
   exact format.
 - **Parallel execution** uses one tokio task per DAG node, a per-task

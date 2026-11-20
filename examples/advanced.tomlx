@@ -27,5 +27,5 @@ command = if ${profile} == "release" { "cargo test --release" } else { "cargo te
 deps    = ["build"]
 
 [tasks.download]
-git('sinisterMage/neomake', 'main', 'neomake/%')
-command = "echo" 'successfully cloned '
+git('theJoeLinuxFoundation/neomake', 'main', 'neomake/%')
+command = "echo successfully cloned"

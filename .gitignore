@@ -2,3 +2,4 @@ target/
 packaging/aur/pkg/
 packaging/aur/src/
 packaging/aur/*.pkg.tar.*
+.neomake/
