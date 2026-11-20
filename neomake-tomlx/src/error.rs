@@ -6,7 +6,7 @@ use thiserror::Error;
 
 /// A diagnostic reporting a TOMLX failure with file/line/col context.
 #[derive(Debug, Error, Clone)]
-#[error("{file}:{line}:{col}: {message}", file = file.display())]
+#[error("{}", self.render())]
 pub struct TomlxError {
     /// Path of the source file (real or synthetic).
     pub file: PathBuf,
@@ -31,6 +31,16 @@ impl TomlxError {
             line,
             col,
             message: message.into(),
+        }
+    }
+
+    /// `file:line:col: message`, or `file: message` when the line is not
+    /// known.
+    fn render(&self) -> String {
+        match (self.line, self.col) {
+            (0, _) => format!("{}: {}", self.file.display(), self.message),
+            (line, 0) => format!("{}:{line}: {}", self.file.display(), self.message),
+            (line, col) => format!("{}:{line}:{col}: {}", self.file.display(), self.message),
         }
     }
 

@@ -1,330 +1,228 @@
-//! Document-level TOMLX evaluator.
+//! Loading TOMLX documents and evaluating their expressions.
 //!
-//! # Pipeline
+//! [`load_documents`] reads a configuration file and every file it
+//! includes, turns each into plain TOML with the scanner (`scanner.rs`),
+//! and returns them as [`Document`]s. [`load`] merges those into one
+//! [`toml::Value`].
 //!
-//! The evaluator owns the document-level scanner. Walking the source
-//! line-by-line it:
+//! # Includes
 //!
-//! 1. Extracts top-level `$name = <EXPR>` variable declarations,
-//!    evaluates each RHS immediately (earlier variables can be
-//!    referenced by later ones), and removes the line from the output.
-//! 2. For every `key = <value>` line whose RHS contains a TOMLX
-//!    sentinel, re-parses the RHS with [`crate::lexer`] + [`crate::parser`],
-//!    evaluates it against the current scope, and re-renders the result
-//!    as a TOML literal.
-//! 3. Leaves every other line of the source untouched.
-//!
-//! The resulting buffer is a pure-TOML document that we hand off to
-//! `toml::from_str` to produce the final [`toml::Value`].
-//!
-//! # Graceful degradation
-//!
-//! If the source contains *no* TOMLX sentinels (`$IDENT =`, `${`, `if `
-//! in value position, or a top-level `env|glob|exec(`), [`load_str`]
-//! short-circuits and parses the input directly as TOML. This
-//! guarantees that any valid `.toml` file is also a valid `.tomlx`
-//! file with identical semantics.
+//! `include = "file"` or `include = ["pattern", ...]`, written before
+//! the first table header, loads further files. Paths and patterns are
+//! relative to the project root (the directory of the top-level file),
+//! whichever file includes them. An included file sees the variables
+//! declared before its `include` line; the variables it declares stay
+//! its own. A file is loaded once however many times it is included.
+//! The documents' tables are merged, and a key that two documents both
+//! define is an error naming both.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use globset::{GlobBuilder, GlobSetBuilder};
-use walkdir::WalkDir;
-
+use crate::builtins;
 use crate::error::TomlxError;
-use crate::lexer::{tokenize, Span};
-use crate::parser::{parse_expr, BinOp, Expr, StringPart, UnaryOp};
-use crate::shell;
+use crate::lexer::Span;
+use crate::parser::{BinOp, Expr, StringPart, UnaryOp};
+use crate::scanner;
+
+/// The variables in scope while a document is evaluated.
+#[derive(Debug, Clone)]
+pub(crate) struct Scope {
+    pub vars: BTreeMap<String, toml::Value>,
+    /// The project root, which relative paths are resolved against.
+    pub root: PathBuf,
+}
+
+impl Scope {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            vars: BTreeMap::new(),
+            root,
+        }
+    }
+}
+
+/// One configuration file, evaluated to plain TOML.
+#[derive(Debug, Clone)]
+pub struct Document {
+    /// The file it was read from.
+    pub path: PathBuf,
+    /// Its content as TOML, with the same line numbering as the source.
+    pub text: String,
+}
+
+/// A configuration file and everything it includes.
+#[derive(Debug, Clone)]
+pub struct Loaded {
+    /// The project root: the directory of the top-level file.
+    pub root: PathBuf,
+    /// The top-level document first, then the included ones in the order
+    /// they were included.
+    pub documents: Vec<Document>,
+}
+
+impl Loaded {
+    /// Every document parsed and merged into one value.
+    pub fn merged(&self) -> Result<toml::Value, TomlxError> {
+        let mut merged = toml::Table::new();
+        let mut origins: HashMap<String, PathBuf> = HashMap::new();
+        for doc in &self.documents {
+            let table = parse_plain_toml(&doc.text, &doc.path)?;
+            merge_into(&mut merged, table, "", &doc.path, &mut origins)?;
+        }
+        Ok(toml::Value::Table(merged))
+    }
+}
+
+/// Load `path` and every file it includes.
+pub fn load_documents(path: &Path) -> Result<Loaded, TomlxError> {
+    let source = read(path)?;
+    load_documents_from(&source, path)
+}
+
+/// Like [`load_documents`], with the top-level file's text given.
+pub fn load_documents_from(source: &str, path: &Path) -> Result<Loaded, TomlxError> {
+    let root = neomake_core::project_root_for(path);
+    let mut loaded = Loaded {
+        root: root.clone(),
+        documents: Vec::new(),
+    };
+    let mut seen = HashSet::new();
+    seen.insert(identity(path));
+    load_one(
+        source,
+        path,
+        Scope::new(root),
+        &mut loaded.documents,
+        &mut seen,
+    )?;
+    Ok(loaded)
+}
 
 /// Evaluate a TOMLX source string into a fully-materialized [`toml::Value`].
 ///
-/// `path` is used purely for diagnostics — pass the real path when
-/// loading from disk; any synthetic name works for in-memory tests.
+/// `path` locates the document for diagnostics and gives the project
+/// root that relative paths and includes are resolved against.
 pub fn load_str(source: &str, path: &Path) -> Result<toml::Value, TomlxError> {
-    if !has_tomlx_markers(source) {
-        return parse_plain_toml(source, path);
-    }
-    let rendered = preprocess(source, path)?;
-    parse_plain_toml(&rendered, path)
+    load_documents_from(source, path)?.merged()
 }
 
-/// Read a file from disk and evaluate it.
+/// Read a file from disk, with everything it includes, and evaluate it.
 pub fn load(path: &Path) -> Result<toml::Value, TomlxError> {
-    let source = std::fs::read_to_string(path).map_err(|e| TomlxError {
-        file: path.to_path_buf(),
-        line: 0,
-        col: 0,
-        message: format!("cannot read `{}`: {e}", path.display()),
-    })?;
-    load_str(&source, path)
+    load_documents(path)?.merged()
 }
 
-fn parse_plain_toml(source: &str, path: &Path) -> Result<toml::Value, TomlxError> {
-    toml::from_str(source).map_err(|e| {
-        let line = e
-            .span()
-            .and_then(|span| line_from_offset(source, span.start))
-            .unwrap_or(0);
-        TomlxError {
-            file: path.to_path_buf(),
-            line,
-            col: 0,
-            message: format!("toml parse error: {}", e.message()),
+fn read(path: &Path) -> Result<String, TomlxError> {
+    std::fs::read_to_string(path)
+        .map_err(|e| TomlxError::at_unknown(path, format!("cannot read `{}`: {e}", path.display())))
+}
+
+fn identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn load_one(
+    source: &str,
+    path: &Path,
+    mut scope: Scope,
+    documents: &mut Vec<Document>,
+    seen: &mut HashSet<PathBuf>,
+) -> Result<(), TomlxError> {
+    let scanned = scanner::scan(source, path, &mut scope)?;
+    documents.push(Document {
+        path: path.to_path_buf(),
+        text: scanned.text,
+    });
+    for include in scanned.includes {
+        for pattern in &include.patterns {
+            let root = &include.scope.root;
+            let files = neomake_core::glob::expand(root, pattern, &[])
+                .map_err(|e| include.span.error(e))?;
+            if files.is_empty() && !neomake_core::glob::is_pattern(pattern) {
+                return Err(include
+                    .span
+                    .error(format!("included file `{pattern}` does not exist")));
+            }
+            for file in files {
+                let file_path = if root == Path::new(".") {
+                    PathBuf::from(&file)
+                } else {
+                    root.join(&file)
+                };
+                if !seen.insert(identity(&file_path)) {
+                    continue;
+                }
+                let text = read(&file_path)?;
+                load_one(&text, &file_path, include.scope.clone(), documents, seen)?;
+            }
         }
+    }
+    Ok(())
+}
+
+fn parse_plain_toml(source: &str, path: &Path) -> Result<toml::Table, TomlxError> {
+    toml::from_str(source).map_err(|e| {
+        let (line, col) = e
+            .span()
+            .map(|span| line_col(source, span.start))
+            .unwrap_or((0, 0));
+        TomlxError::new(path, line, col, e.message().to_string())
     })
 }
 
-fn line_from_offset(source: &str, offset: usize) -> Option<usize> {
-    if offset > source.len() {
-        return None;
-    }
-    Some(source[..offset].bytes().filter(|&b| b == b'\n').count() + 1)
+fn line_col(source: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(source.len());
+    let before = &source[..offset];
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    (line, before[line_start..].chars().count() + 1)
 }
 
-/// Cheap check: does the source contain anything that TOMLX cares about
-/// at the line level? If not, we can skip the whole pipeline.
-fn has_tomlx_markers(source: &str) -> bool {
-    // Any top-level `$ident =` line is a variable declaration.
-    for line in source.lines() {
-        let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix('$') {
-            if rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
-                return true;
-            }
-        }
-    }
-    // ${ appears only in TOMLX interpolation
-    if source.contains("${") {
-        return true;
-    }
-    // A value-level conditional.
-    if source.contains("= if ") || source.contains(" =if ") {
-        return true;
-    }
-    // Bare function calls or evaluator expressions
-    if source.contains("git(") || source.contains("fetch(") {
-        return true;
-    }
-    false
-}
-
-/// Scope tracking top-level variables evaluated so far.
-#[derive(Debug, Default, Clone)]
-struct Scope {
-    vars: BTreeMap<String, toml::Value>,
-    base_dir: PathBuf,
-}
-
-fn preprocess(source: &str, path: &Path) -> Result<String, TomlxError> {
-    let base_dir = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let mut scope = Scope {
-        vars: BTreeMap::new(),
-        base_dir,
-    };
-    let mut out = String::with_capacity(source.len());
-
-    for (idx, line) in source.split_inclusive('\n').enumerate() {
-        let line_no = idx + 1;
-        let (body, newline) = split_trailing_newline(line);
-        let trimmed = body.trim_start();
-        let leading = &body[..(body.len() - trimmed.len())];
-
-        // Top-level variable declaration: `$name = EXPR`.
-        if let Some(rest) = trimmed.strip_prefix('$') {
-            if rest
-                .chars()
-                .next()
-                .map(|c| c.is_ascii_alphabetic() || c == '_')
-                .unwrap_or(false)
-            {
-                let (name, after_name) = take_ident(rest);
-                let after_name = after_name.trim_start();
-                let after_eq = after_name.strip_prefix('=').ok_or_else(|| {
-                    TomlxError::new(
-                        path,
-                        line_no,
-                        leading.len() + 1,
-                        "variable declaration must use `=`",
-                    )
-                })?;
-                let (expr_src, _inline_comment) = strip_inline_comment(after_eq.trim_start());
-                let base_span = Span::new(path, line_no, column_of(body, expr_src));
-                let expr = parse_source_expr(expr_src, &base_span)?;
-                let value = evaluate(&expr, &scope)?;
-                scope.vars.insert(name, value);
-                // Emit a blank line (preserves line numbering for downstream errors).
-                out.push_str(newline);
-                continue;
-            }
-        }
-
-        // `key = value` style line.
-        if let Some((key_part, value_part)) = split_key_value(body) {
-            if value_contains_tomlx_sentinel(value_part) {
-                let (expr_src, _trailing_comment) = strip_inline_comment(value_part);
-                let base_span = Span::new(path, line_no, column_of(body, expr_src));
-                let expr = parse_source_expr(expr_src.trim(), &base_span)?;
-                let value = evaluate(&expr, &scope)?;
-                let rendered = render_toml_value(&value);
-                out.push_str(leading);
-                out.push_str(key_part.trim_end());
-                out.push_str(" = ");
-                out.push_str(&rendered);
-                out.push_str(newline);
-                continue;
-            }
-        }
-
-        if trimmed.starts_with("git(") || trimmed.starts_with("fetch(") {
-            let (expr_src, _trailing_comment) = strip_inline_comment(trimmed);
-            let base_span = Span::new(path, line_no, column_of(body, expr_src));
-            let expr = parse_source_expr(expr_src.trim(), &base_span)?;
-            let _ = evaluate(&expr, &scope)?;
-            out.push_str(newline);
-            continue;
-        }
-
-        // Fallthrough: verbatim.
-        out.push_str(body);
-        out.push_str(newline);
-    }
-
-    Ok(out)
-}
-
-fn split_trailing_newline(line: &str) -> (&str, &str) {
-    if let Some(stripped) = line.strip_suffix("\r\n") {
-        (stripped, "\r\n")
-    } else if let Some(stripped) = line.strip_suffix('\n') {
-        (stripped, "\n")
-    } else {
-        (line, "")
-    }
-}
-
-fn take_ident(s: &str) -> (String, &str) {
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        if i == 0 {
-            if !(c.is_ascii_alphabetic() || c == '_') {
-                break;
-            }
-            end = i + c.len_utf8();
-        } else if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            end = i + c.len_utf8();
+/// Merge `src`, read from `doc`, into `dst`. `origins` remembers which
+/// document first defined each key path, for the conflict message.
+fn merge_into(
+    dst: &mut toml::Table,
+    src: toml::Table,
+    prefix: &str,
+    doc: &Path,
+    origins: &mut HashMap<String, PathBuf>,
+) -> Result<(), TomlxError> {
+    for (key, value) in src {
+        let path = if prefix.is_empty() {
+            key.clone()
         } else {
-            break;
-        }
-    }
-    (s[..end].to_string(), &s[end..])
-}
-
-/// Split a `key = value` line into `(key_with_leading_ws, value_after_eq)`.
-///
-/// Aware of string literals — a `=` inside `"..."` or `'...'` does not count.
-/// Returns `None` if the line has no such split or if the LHS is a table header.
-fn split_key_value(body: &str) -> Option<(&str, &str)> {
-    let bytes = body.as_bytes();
-    let trimmed = body.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
-        return None;
-    }
-    let mut in_double = false;
-    let mut in_single = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if !in_single && b == b'"' {
-            // naive double-quote toggling; we don't care about escapes
-            // beyond not-the-quote for the purposes of locating `=`.
-            let prev = if i > 0 { bytes[i - 1] } else { 0 };
-            if prev != b'\\' {
-                in_double = !in_double;
+            format!("{prefix}.{key}")
+        };
+        match dst.get_mut(&key) {
+            None => {
+                origins.insert(path, doc.to_path_buf());
+                dst.insert(key, value);
             }
-        } else if !in_double && b == b'\'' {
-            in_single = !in_single;
-        } else if !in_double && !in_single && b == b'=' {
-            return Some((&body[..i], &body[i + 1..]));
-        }
-        i += 1;
-    }
-    None
-}
-
-fn strip_inline_comment(s: &str) -> (&str, Option<&str>) {
-    let bytes = s.as_bytes();
-    let mut in_double = false;
-    let mut in_single = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if !in_single && b == b'"' {
-            let prev = if i > 0 { bytes[i - 1] } else { 0 };
-            if prev != b'\\' {
-                in_double = !in_double;
+            Some(toml::Value::Table(existing)) if value.is_table() => {
+                let toml::Value::Table(incoming) = value else {
+                    unreachable!("checked by the guard")
+                };
+                merge_into(existing, incoming, &path, doc, origins)?;
             }
-        } else if !in_double && b == b'\'' {
-            in_single = !in_single;
-        } else if !in_double && !in_single && b == b'#' {
-            return (&s[..i], Some(&s[i..]));
-        }
-        i += 1;
-    }
-    (s, None)
-}
-
-fn value_contains_tomlx_sentinel(value_raw: &str) -> bool {
-    // Dollar interpolation or variable reference.
-    if value_raw.contains("${") {
-        return true;
-    }
-    let trimmed = value_raw.trim_start();
-    if trimmed.starts_with('$')
-        && trimmed
-            .chars()
-            .nth(1)
-            .map(|c| c.is_ascii_alphabetic() || c == '_')
-            .unwrap_or(false)
-    {
-        return true;
-    }
-    // Value-level conditional.
-    if trimmed.starts_with("if ") || trimmed.contains(" if ") {
-        return true;
-    }
-    // Built-in function at the top level of the RHS.
-    for name in ["env(", "glob(", "exec(", "git(", "fetch("] {
-        if trimmed.starts_with(name) || trimmed.contains(&format!(" {name}")) {
-            return true;
+            Some(_) => {
+                let first = origin_of(&path, origins).unwrap_or_else(|| doc.to_path_buf());
+                return Err(TomlxError::at_unknown(
+                    doc,
+                    format!("`{path}` is defined both here and in {}", first.display()),
+                ));
+            }
         }
     }
-    false
+    Ok(())
 }
 
-fn parse_source_expr(src: &str, base: &Span) -> Result<Expr, TomlxError> {
-    let tokens = tokenize(src, base)?;
-    if tokens.is_empty() {
-        return Err(TomlxError::new(
-            &base.file,
-            base.line,
-            base.col,
-            "expected expression",
-        ));
-    }
-    parse_expr(tokens)
-}
-
-fn column_of(body: &str, slice: &str) -> usize {
-    let body_ptr = body.as_ptr() as usize;
-    let slice_ptr = slice.as_ptr() as usize;
-    if slice_ptr >= body_ptr && slice_ptr <= body_ptr + body.len() {
-        slice_ptr - body_ptr + 1
-    } else {
-        1
+fn origin_of(path: &str, origins: &HashMap<String, PathBuf>) -> Option<PathBuf> {
+    let mut candidate = path;
+    loop {
+        if let Some(origin) = origins.get(candidate) {
+            return Some(origin.clone());
+        }
+        candidate = &candidate[..candidate.rfind('.')?];
     }
 }
 
@@ -332,7 +230,9 @@ fn column_of(body: &str, slice: &str) -> usize {
 // Expression evaluation.
 // -----------------------------------------------------------------------
 
-fn evaluate(expr: &Expr, scope: &Scope) -> Result<toml::Value, TomlxError> {
+/// Evaluate `expr`. `at` locates errors that have no closer location,
+/// such as an operator applied to the wrong types.
+pub(crate) fn evaluate(expr: &Expr, scope: &Scope, at: &Span) -> Result<toml::Value, TomlxError> {
     match expr {
         Expr::Int(n) => Ok(toml::Value::Integer(*n)),
         Expr::Float(f) => Ok(toml::Value::Float(*f)),
@@ -344,7 +244,7 @@ fn evaluate(expr: &Expr, scope: &Scope) -> Result<toml::Value, TomlxError> {
                 match part {
                     StringPart::Lit(s) => buf.push_str(s),
                     StringPart::Interp(e) => {
-                        let v = evaluate(e, scope)?;
+                        let v = evaluate(e, scope, at)?;
                         buf.push_str(&stringify_value(&v));
                     }
                 }
@@ -354,113 +254,164 @@ fn evaluate(expr: &Expr, scope: &Scope) -> Result<toml::Value, TomlxError> {
         Expr::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(evaluate(item, scope)?);
+                out.push(evaluate(item, scope, at)?);
             }
             Ok(toml::Value::Array(out))
         }
-        Expr::Var(name) => scope.vars.get(name).cloned().ok_or_else(|| {
-            TomlxError::at_unknown(
-                std::path::PathBuf::new(),
-                format!("undefined variable `{name}`"),
-            )
-        }),
+        Expr::Table(entries) => {
+            let mut table = toml::Table::new();
+            for (key, value) in entries {
+                let value = evaluate(value, scope, at)?;
+                insert_dotted(&mut table, key, value).map_err(|msg| at.error(msg))?;
+            }
+            Ok(toml::Value::Table(table))
+        }
+        Expr::Var { name, span } => scope
+            .vars
+            .get(name)
+            .cloned()
+            .ok_or_else(|| span.error(format!("undefined variable `{name}`"))),
         Expr::Call { name, args, span } => call_builtin(name, args, scope, span),
         Expr::Binary { op, lhs, rhs } => {
-            let l = evaluate(lhs, scope)?;
-            let r = evaluate(rhs, scope)?;
-            apply_binop(*op, &l, &r)
+            let l = evaluate(lhs, scope, at)?;
+            // `&&` and `||` short-circuit.
+            match (op, &l) {
+                (BinOp::And, toml::Value::Boolean(false)) => return Ok(l),
+                (BinOp::Or, toml::Value::Boolean(true)) => return Ok(l),
+                _ => {}
+            }
+            let r = evaluate(rhs, scope, at)?;
+            apply_binop(*op, &l, &r).map_err(|msg| at.error(msg))
         }
         Expr::Unary { op, expr } => {
-            let v = evaluate(expr, scope)?;
-            apply_unary(*op, &v)
+            let v = evaluate(expr, scope, at)?;
+            apply_unary(*op, &v).map_err(|msg| at.error(msg))
         }
-        Expr::KeywordArg { .. } => Err(TomlxError::at_unknown(
-            std::path::PathBuf::new(),
-            "keyword arguments are only valid inside function calls",
-        )),
+        Expr::KeywordArg { .. } => {
+            Err(at.error("keyword arguments are only valid inside function calls"))
+        }
         Expr::If {
             cond,
             then_branch,
             else_branch,
-        } => {
-            let c = evaluate(cond, scope)?;
-            let b = match c {
-                toml::Value::Boolean(b) => b,
-                other => {
-                    return Err(TomlxError::at_unknown(
-                        std::path::PathBuf::new(),
-                        format!("if condition must be boolean, got {}", type_of(&other)),
-                    ))
-                }
-            };
-            if b {
-                evaluate(then_branch, scope)
-            } else {
-                evaluate(else_branch, scope)
-            }
-        }
+        } => match evaluate(cond, scope, at)? {
+            toml::Value::Boolean(true) => evaluate(then_branch, scope, at),
+            toml::Value::Boolean(false) => evaluate(else_branch, scope, at),
+            other => Err(at.error(format!(
+                "an if condition must be a boolean, got {}",
+                type_of(&other)
+            ))),
+        },
     }
 }
 
-fn apply_binop(op: BinOp, l: &toml::Value, r: &toml::Value) -> Result<toml::Value, TomlxError> {
+fn insert_dotted(
+    table: &mut toml::Table,
+    key: &[String],
+    value: toml::Value,
+) -> Result<(), String> {
+    let (last, parents) = key.split_last().expect("a key has at least one part");
+    let mut current = table;
+    for part in parents {
+        let entry = current
+            .entry(part.clone())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        current = match entry {
+            toml::Value::Table(t) => t,
+            _ => return Err(format!("`{}` is not a table", key.join("."))),
+        };
+    }
+    if current.insert(last.clone(), value).is_some() {
+        return Err(format!("`{}` is given twice", key.join(".")));
+    }
+    Ok(())
+}
+
+fn call_builtin(
+    name: &str,
+    args: &[Expr],
+    scope: &Scope,
+    span: &Span,
+) -> Result<toml::Value, TomlxError> {
+    let builtin = builtins::lookup(name).ok_or_else(|| {
+        let known: Vec<&str> = builtins::BUILTINS.iter().map(|b| b.name).collect();
+        span.error(format!(
+            "unknown function `{name}` (the built-ins are {})",
+            known.join(", ")
+        ))
+    })?;
+    let mut positional = Vec::new();
+    let mut kwargs = BTreeMap::new();
+    for arg in args {
+        match arg {
+            Expr::KeywordArg { name, value } => {
+                kwargs.insert(name.clone(), evaluate(value, scope, span)?);
+            }
+            other => positional.push(evaluate(other, scope, span)?),
+        }
+    }
+    (builtin.call)(&builtins::Args {
+        name,
+        positional,
+        kwargs,
+        span,
+        scope,
+    })
+}
+
+fn apply_binop(op: BinOp, l: &toml::Value, r: &toml::Value) -> Result<toml::Value, String> {
     use toml::Value as V;
-    let err = |msg: String| TomlxError::at_unknown(std::path::PathBuf::new(), msg);
     match op {
         BinOp::Eq => Ok(V::Boolean(values_equal(l, r))),
         BinOp::Ne => Ok(V::Boolean(!values_equal(l, r))),
         BinOp::And => match (l, r) {
             (V::Boolean(a), V::Boolean(b)) => Ok(V::Boolean(*a && *b)),
-            _ => Err(err(format!(
+            _ => Err(format!(
                 "&& requires booleans, got {} and {}",
                 type_of(l),
                 type_of(r)
-            ))),
+            )),
         },
         BinOp::Or => match (l, r) {
             (V::Boolean(a), V::Boolean(b)) => Ok(V::Boolean(*a || *b)),
-            _ => Err(err(format!(
+            _ => Err(format!(
                 "|| requires booleans, got {} and {}",
                 type_of(l),
                 type_of(r)
-            ))),
+            )),
         },
         BinOp::Plus => match (l, r) {
-            (V::Integer(a), V::Integer(b)) => Ok(V::Integer(a + b)),
+            (V::Integer(a), V::Integer(b)) => a
+                .checked_add(*b)
+                .map(V::Integer)
+                .ok_or_else(|| "integer overflow in `+`".to_string()),
             (V::Float(a), V::Float(b)) => Ok(V::Float(a + b)),
-            (V::String(a), V::String(b)) => {
-                let mut s = a.clone();
-                s.push_str(b);
-                Ok(V::String(s))
-            }
+            (V::String(a), V::String(b)) => Ok(V::String(format!("{a}{b}"))),
             (V::Array(a), V::Array(b)) => {
                 let mut out = a.clone();
                 out.extend(b.iter().cloned());
                 Ok(V::Array(out))
             }
-            _ => Err(err(format!(
+            _ => Err(format!(
                 "cannot apply `+` to {} and {}",
                 type_of(l),
                 type_of(r)
-            ))),
+            )),
         },
     }
 }
 
-fn apply_unary(op: UnaryOp, v: &toml::Value) -> Result<toml::Value, TomlxError> {
+fn apply_unary(op: UnaryOp, v: &toml::Value) -> Result<toml::Value, String> {
     use toml::Value as V;
-    let err = |msg: String| TomlxError::at_unknown(std::path::PathBuf::new(), msg);
     match op {
         UnaryOp::Not => match v {
             V::Boolean(b) => Ok(V::Boolean(!*b)),
-            _ => Err(err(format!("`!` requires bool, got {}", type_of(v)))),
+            _ => Err(format!("`!` requires a boolean, got {}", type_of(v))),
         },
         UnaryOp::Neg => match v {
             V::Integer(n) => Ok(V::Integer(-*n)),
             V::Float(f) => Ok(V::Float(-*f)),
-            _ => Err(err(format!(
-                "unary `-` requires number, got {}",
-                type_of(v)
-            ))),
+            _ => Err(format!("unary `-` requires a number, got {}", type_of(v))),
         },
     }
 }
@@ -472,6 +423,15 @@ fn values_equal(a: &toml::Value, b: &toml::Value) -> bool {
         (V::Integer(x), V::Integer(y)) => x == y,
         (V::Float(x), V::Float(y)) => x == y,
         (V::Boolean(x), V::Boolean(y)) => x == y,
+        (V::Datetime(x), V::Datetime(y)) => x == y,
+        (V::Array(x), V::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| values_equal(p, q))
+        }
+        (V::Table(x), V::Table(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| values_equal(v, w)))
+        }
         _ => false,
     }
 }
@@ -491,7 +451,8 @@ fn stringify_value(v: &toml::Value) -> String {
     }
 }
 
-fn type_of(v: &toml::Value) -> &'static str {
+/// The name of a value's type, as diagnostics give it.
+pub(crate) fn type_of(v: &toml::Value) -> &'static str {
     match v {
         toml::Value::String(_) => "string",
         toml::Value::Integer(_) => "integer",
@@ -504,291 +465,24 @@ fn type_of(v: &toml::Value) -> &'static str {
 }
 
 // -----------------------------------------------------------------------
-// Built-in functions.
-// -----------------------------------------------------------------------
-
-fn call_builtin(
-    name: &str,
-    args: &[Expr],
-    scope: &Scope,
-    span: &Span,
-) -> Result<toml::Value, TomlxError> {
-    let mk_err = |msg: String| TomlxError::new(&span.file, span.line, span.col, msg);
-
-    let mut positional = Vec::new();
-    let mut kwargs = BTreeMap::new();
-    for arg in args {
-        match arg {
-            Expr::KeywordArg { name, value } => {
-                kwargs.insert(name.as_str(), evaluate(value, scope)?);
-            }
-            _ => {
-                positional.push(evaluate(arg, scope)?);
-            }
-        }
-    }
-
-    match name {
-        "env" => {
-            if !kwargs.is_empty() {
-                return Err(mk_err("env() does not accept keyword arguments".into()));
-            }
-            if positional.is_empty() || positional.len() > 2 {
-                return Err(mk_err(format!(
-                    "env() expects 1 or 2 arguments, got {}",
-                    positional.len()
-                )));
-            }
-            let key = expect_string(&positional[0], "env() first argument", &mk_err)?;
-            match std::env::var(&key) {
-                Ok(v) => Ok(toml::Value::String(v)),
-                Err(_) => {
-                    if positional.len() == 2 {
-                        Ok(positional[1].clone())
-                    } else {
-                        Err(mk_err(format!(
-                            "environment variable `{key}` not set (use env(\"{key}\", \"default\") to provide a fallback)"
-                        )))
-                    }
-                }
-            }
-        }
-        "glob" => {
-            if !kwargs.is_empty() {
-                return Err(mk_err("glob() does not accept keyword arguments".into()));
-            }
-            if positional.len() != 1 {
-                return Err(mk_err(format!(
-                    "glob() expects 1 argument, got {}",
-                    positional.len()
-                )));
-            }
-            let pat = expect_string(&positional[0], "glob() argument", &mk_err)?;
-            let mut builder = GlobSetBuilder::new();
-            let glob = GlobBuilder::new(&pat)
-                .literal_separator(true)
-                .build()
-                .map_err(|e| mk_err(format!("invalid glob `{pat}`: {e}")))?;
-            builder.add(glob);
-            let set = builder
-                .build()
-                .map_err(|e| mk_err(format!("glob build failed: {e}")))?;
-
-            let mut matches: Vec<String> = Vec::new();
-            let root = &scope.base_dir;
-            for entry in WalkDir::new(root).follow_links(false) {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let rel = match entry.path().strip_prefix(root) {
-                    Ok(r) => r.to_path_buf(),
-                    Err(_) => continue,
-                };
-                if rel.starts_with(".neomake") {
-                    continue;
-                }
-                // Globset uses `/`; on Windows, `WalkDir` produces `\\`.
-                // Normalize so portable patterns match on every host and
-                // the returned strings are also portable.
-                let rel_str = if std::path::MAIN_SEPARATOR == '/' {
-                    rel.to_string_lossy().into_owned()
-                } else {
-                    rel.to_string_lossy()
-                        .replace(std::path::MAIN_SEPARATOR, "/")
-                };
-                if set.is_match(&rel_str) {
-                    matches.push(rel_str);
-                }
-            }
-            matches.sort();
-            Ok(toml::Value::Array(
-                matches.into_iter().map(toml::Value::String).collect(),
-            ))
-        }
-        "exec" => {
-            if !kwargs.is_empty() {
-                return Err(mk_err("exec() does not accept keyword arguments".into()));
-            }
-            if positional.len() != 1 {
-                return Err(mk_err(format!(
-                    "exec() expects 1 argument, got {}",
-                    positional.len()
-                )));
-            }
-            let cmd = expect_string(&positional[0], "exec() argument", &mk_err)?;
-            let invocation = shell::resolve();
-            let output = Command::new(&invocation.program)
-                .args(&invocation.args)
-                .arg(&cmd)
-                .current_dir(&scope.base_dir)
-                .output()
-                .map_err(|e| mk_err(format!("exec(`{cmd}`) failed to spawn: {e}")))?;
-            if !output.status.success() {
-                return Err(mk_err(format!(
-                    "exec(`{cmd}`) exited with status {}",
-                    output.status
-                )));
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout)
-                .trim_end()
-                .to_string();
-            Ok(toml::Value::String(stdout))
-        }
-        "git" => {
-            if positional.len() != 3 {
-                return Err(mk_err(format!(
-                    "git() expects 3 positional arguments, got {}",
-                    positional.len()
-                )));
-            }
-            let repo = expect_string(&positional[0], "git() repo", &mk_err)?;
-            let tag = expect_string(&positional[1], "git() tag", &mk_err)?;
-            let dest_template = expect_string(&positional[2], "git() dest", &mk_err)?;
-
-            let submodules = if let Some(v) = kwargs.get("submodules") {
-                expect_bool(v, "git() submodules", &mk_err)?
-            } else {
-                false
-            };
-
-            let depth = if let Some(v) = kwargs.get("depth") {
-                Some(expect_int(v, "git() depth", &mk_err)? as u32)
-            } else {
-                None
-            };
-
-            let basename = crate::fetch::extract_basename(&repo);
-            let dest = crate::fetch::resolve_wildcard(&dest_template, &basename, None);
-
-            let (path, sha) = crate::fetch::git_clone(&repo, &tag, &dest, submodules, depth)
-                .map_err(|e| mk_err(format!("git() error: {e}")))?;
-
-            let mut manifest = neomake_core::asset::AssetManifest::load(&scope.base_dir);
-            manifest.add(
-                path.clone(),
-                neomake_core::asset::AssetRecord {
-                    kind: neomake_core::asset::AssetKind::Git { commit_sha: sha },
-                    source: repo,
-                },
-            );
-            manifest.save(&scope.base_dir);
-
-            Ok(toml::Value::String(path.to_string_lossy().to_string()))
-        }
-        "fetch" => {
-            if positional.len() != 2 {
-                return Err(mk_err(format!(
-                    "fetch() expects 2 positional arguments, got {}",
-                    positional.len()
-                )));
-            }
-            let url = expect_string(&positional[0], "fetch() url", &mk_err)?;
-            let dest_template = expect_string(&positional[1], "fetch() dest", &mk_err)?;
-
-            let sha256_expected = if let Some(v) = kwargs.get("sha256") {
-                Some(expect_string(v, "fetch() sha256", &mk_err)?)
-            } else {
-                None
-            };
-
-            let alias = if let Some(v) = kwargs.get("alias") {
-                Some(expect_string(v, "fetch() alias", &mk_err)?)
-            } else {
-                None
-            };
-
-            let extract = if let Some(v) = kwargs.get("extract") {
-                expect_bool(v, "fetch() extract", &mk_err)?
-            } else {
-                false
-            };
-
-            let basename = crate::fetch::extract_basename(&url);
-            let dest = crate::fetch::resolve_wildcard(&dest_template, &basename, alias.as_deref());
-
-            let (path, sha) =
-                crate::fetch::http_fetch(&url, &dest, sha256_expected.as_deref(), extract)
-                    .map_err(|e| mk_err(format!("fetch() error: {e}")))?;
-
-            let mut manifest = neomake_core::asset::AssetManifest::load(&scope.base_dir);
-            manifest.add(
-                path.clone(),
-                neomake_core::asset::AssetRecord {
-                    kind: neomake_core::asset::AssetKind::Fetch {
-                        content_sha256: sha,
-                    },
-                    source: url,
-                },
-            );
-            manifest.save(&scope.base_dir);
-
-            Ok(toml::Value::String(path.to_string_lossy().to_string()))
-        }
-        other => Err(mk_err(format!("unknown function `{other}`"))),
-    }
-}
-
-fn expect_string(
-    v: &toml::Value,
-    label: &str,
-    mk_err: &dyn Fn(String) -> TomlxError,
-) -> Result<String, TomlxError> {
-    match v {
-        toml::Value::String(s) => Ok(s.clone()),
-        other => Err(mk_err(format!(
-            "{label} must be string, got {}",
-            type_of(other)
-        ))),
-    }
-}
-
-fn expect_bool(
-    v: &toml::Value,
-    label: &str,
-    mk_err: &dyn Fn(String) -> TomlxError,
-) -> Result<bool, TomlxError> {
-    match v {
-        toml::Value::Boolean(b) => Ok(*b),
-        other => Err(mk_err(format!(
-            "{label} must be boolean, got {}",
-            type_of(other)
-        ))),
-    }
-}
-
-fn expect_int(
-    v: &toml::Value,
-    label: &str,
-    mk_err: &dyn Fn(String) -> TomlxError,
-) -> Result<i64, TomlxError> {
-    match v {
-        toml::Value::Integer(i) => Ok(*i),
-        other => Err(mk_err(format!(
-            "{label} must be integer, got {}",
-            type_of(other)
-        ))),
-    }
-}
-
-// -----------------------------------------------------------------------
 // TOML value renderer (value → syntax).
 // -----------------------------------------------------------------------
 
-/// Render a [`toml::Value`] as an inline TOML literal.
+/// Render a [`toml::Value`] as an inline TOML literal on one line.
 ///
 /// Used to substitute evaluated TOMLX expressions back into the
-/// pre-processed source. Not a general TOML serializer — it targets the
-/// subset that can appear on the RHS of a single `key = value` line.
+/// scanned document. Strings are rendered as basic strings with every
+/// control character escaped, tables as inline tables.
 pub fn render_toml_value(v: &toml::Value) -> String {
     match v {
         toml::Value::String(s) => render_string(s),
         toml::Value::Integer(n) => n.to_string(),
         toml::Value::Float(f) => {
-            if f.is_finite() && f.fract() == 0.0 {
+            if f.is_nan() {
+                "nan".into()
+            } else if f.is_infinite() {
+                if *f > 0.0 { "inf" } else { "-inf" }.into()
+            } else if f.fract() == 0.0 {
                 format!("{f:.1}")
             } else {
                 f.to_string()
@@ -801,6 +495,9 @@ pub fn render_toml_value(v: &toml::Value) -> String {
             format!("[{}]", parts.join(", "))
         }
         toml::Value::Table(tbl) => {
+            if tbl.is_empty() {
+                return "{}".into();
+            }
             let parts: Vec<String> = tbl
                 .iter()
                 .map(|(k, v)| format!("{} = {}", render_key(k), render_toml_value(v)))
@@ -831,7 +528,9 @@ fn render_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -849,6 +548,16 @@ mod tests {
         load_str(src, &PathBuf::from("test.tomlx"))
     }
 
+    fn get<'a>(v: &'a toml::Value, path: &str) -> &'a toml::Value {
+        path.split('.').fold(v, |v, k| {
+            v.get(k).unwrap_or_else(|| panic!("no `{k}` in {v:?}"))
+        })
+    }
+
+    fn get_str<'a>(v: &'a toml::Value, path: &str) -> &'a str {
+        get(v, path).as_str().unwrap()
+    }
+
     #[test]
     fn plain_toml_degrades_cleanly() {
         let src = r#"
@@ -857,13 +566,14 @@ command = "cargo build"
 deps = ["codegen"]
 "#;
         let v = load_s(src).unwrap();
-        let cmd = v
-            .get("tasks")
-            .and_then(|t| t.get("build"))
-            .and_then(|b| b.get("command"))
-            .and_then(|c| c.as_str())
-            .unwrap();
-        assert_eq!(cmd, "cargo build");
+        assert_eq!(get_str(&v, "tasks.build.command"), "cargo build");
+    }
+
+    #[test]
+    fn plain_toml_passes_through_verbatim() {
+        let src = "# a comment\n[a]\nx = 1 # trailing\ny = [\n  \"p\", # one\n  'q',\n]\nz = { k = 'v' }\nw = 1979-05-27T07:32:00Z\n";
+        let loaded = load_documents_from(src, Path::new("t.toml")).unwrap();
+        assert_eq!(loaded.documents[0].text, src);
     }
 
     #[test]
@@ -875,14 +585,7 @@ $profile = "release"
 command = "cargo build --${profile}"
 "#;
         let v = load_s(src).unwrap();
-        assert_eq!(
-            v.get("tasks")
-                .and_then(|t| t.get("build"))
-                .and_then(|b| b.get("command"))
-                .and_then(|c| c.as_str())
-                .unwrap(),
-            "cargo build --release"
-        );
+        assert_eq!(get_str(&v, "tasks.build.command"), "cargo build --release");
     }
 
     #[test]
@@ -894,14 +597,7 @@ $ci = true
 command = if ${ci} { "make ci-test" } else { "make test" }
 "#;
         let v = load_s(src).unwrap();
-        assert_eq!(
-            v.get("tasks")
-                .and_then(|t| t.get("test"))
-                .and_then(|b| b.get("command"))
-                .and_then(|c| c.as_str())
-                .unwrap(),
-            "make ci-test"
-        );
+        assert_eq!(get_str(&v, "tasks.test.command"), "make ci-test");
     }
 
     #[test]
@@ -913,19 +609,30 @@ $ci = false
 command = if ${ci} { "make ci-test" } else { "make test" }
 "#;
         let v = load_s(src).unwrap();
-        assert_eq!(
-            v.get("tasks")
-                .and_then(|t| t.get("test"))
-                .and_then(|b| b.get("command"))
-                .and_then(|c| c.as_str())
-                .unwrap(),
-            "make test"
-        );
+        assert_eq!(get_str(&v, "tasks.test.command"), "make test");
+    }
+
+    #[test]
+    fn conditionals_may_span_lines_and_chain() {
+        let src = r#"
+$level = "b"
+[t]
+v = if level == "a" {
+  1
+} else if level == "b" {
+  2
+} else {
+  3
+}
+after = 4
+"#;
+        let v = load_s(src).unwrap();
+        assert_eq!(get(&v, "t.v").as_integer(), Some(2));
+        assert_eq!(get(&v, "t.after").as_integer(), Some(4));
     }
 
     #[test]
     fn env_function_with_default() {
-        // Use a name unlikely to be in the environment.
         let src = r#"
 $who = env("NEOMAKE_TEST_UNLIKELY_VAR_X9", "nobody")
 
@@ -933,12 +640,14 @@ $who = env("NEOMAKE_TEST_UNLIKELY_VAR_X9", "nobody")
 name = ${who}
 "#;
         let v = load_s(src).unwrap();
-        assert_eq!(
-            v.get("who")
-                .and_then(|t| t.get("name"))
-                .and_then(|s| s.as_str()),
-            Some("nobody")
-        );
+        assert_eq!(get_str(&v, "who.name"), "nobody");
+    }
+
+    #[test]
+    fn calls_without_a_dollar_are_evaluated() {
+        let src = "[w]\nname = env(\"NEOMAKE_TEST_UNLIKELY_VAR_X9\", \"nobody\")\n";
+        let v = load_s(src).unwrap();
+        assert_eq!(get_str(&v, "w.name"), "nobody");
     }
 
     #[test]
@@ -950,29 +659,19 @@ $suffix = "world"
 msg = "hello " + ${suffix}
 "#;
         let v = load_s(src).unwrap();
-        assert_eq!(
-            v.get("m")
-                .and_then(|m| m.get("msg"))
-                .and_then(|s| s.as_str()),
-            Some("hello world")
-        );
+        assert_eq!(get_str(&v, "m.msg"), "hello world");
     }
 
     #[test]
-    fn undefined_variable_errors() {
-        let src = r#"
-[x]
-y = ${nope}
-"#;
-        // Need at least one TOMLX marker for the preprocessor to engage.
-        // Include a sentinel by prefixing a var decl that's unused.
-        let src = format!("$_sentinel = true\n{src}");
-        let err = load_s(&src).unwrap_err();
+    fn undefined_variable_errors_with_its_location() {
+        let src = "[x]\ny = ${nope}\n";
+        let err = load_s(src).unwrap_err();
         assert!(
             err.message.contains("undefined variable"),
             "{}",
             err.message
         );
+        assert_eq!((err.line, err.col), (2, 5));
     }
 
     #[test]
@@ -984,12 +683,185 @@ $name = "foo"
 files = ["a", "${name}.rs", "b"]
 "#;
         let v = load_s(src).unwrap();
-        let arr = v
-            .get("t")
-            .and_then(|t| t.get("files"))
-            .and_then(|a| a.as_array())
-            .unwrap();
-        assert_eq!(arr[1].as_str(), Some("foo.rs"));
+        assert_eq!(
+            get(&v, "t.files").as_array().unwrap()[1].as_str(),
+            Some("foo.rs")
+        );
+    }
+
+    #[test]
+    fn interpolates_inside_multiline_arrays() {
+        let src =
+            "$name = \"foo\"\n[t]\nfiles = [\n  \"a\", # first\n  \"${name}.rs\",\n]\nnext = 1\n";
+        let loaded = load_documents_from(src, Path::new("t.tomlx")).unwrap();
+        // Line numbers are kept: `next` is still on line 7.
+        assert_eq!(loaded.documents[0].text.lines().nth(6), Some("next = 1"));
+        let v = loaded.merged().unwrap();
+        let files: Vec<&str> = get(&v, "t.files")
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap())
+            .collect();
+        assert_eq!(files, vec!["a", "foo.rs"]);
+    }
+
+    #[test]
+    fn inline_tables_hold_expressions() {
+        let src = "$x = \"1\"\n[t]\nenv = { A = \"${x}\", B.C = 'lit' }\n";
+        let v = load_s(src).unwrap();
+        assert_eq!(get_str(&v, "t.env.A"), "1");
+        assert_eq!(get_str(&v, "t.env.B.C"), "lit");
+    }
+
+    #[test]
+    fn multiline_literal_strings_are_left_alone() {
+        // A shell script whose lines look like declarations, statements
+        // and interpolations must reach TOML exactly as written.
+        let script = "$x = 1\ngit(this is not a call)\necho \"${HOME}\" $?\ninclude = nothing\n";
+        let src = format!("$v = 2\n[t]\nrun = '''\n{script}'''\nafter = ${{v}}\n");
+        let v = load_s(&src).unwrap();
+        assert_eq!(get_str(&v, "t.run"), script);
+        assert_eq!(get(&v, "t.after").as_integer(), Some(2));
+    }
+
+    #[test]
+    fn multiline_basic_strings_interpolate() {
+        let src = "$who = \"joe\"\n[t]\nmsg = \"\"\"\nhello ${who}\n$HOME stays\n\"\"\"\n";
+        let v = load_s(src).unwrap();
+        assert_eq!(get_str(&v, "t.msg"), "hello joe\n$HOME stays\n");
+    }
+
+    #[test]
+    fn arrays_of_inline_tables_pass_through() {
+        let src = "[t]\nsteps = [\n  { run = 'echo ${X}', contains = \"a\" },\n  { run = '''\nmulti\n''' },\n]\n";
+        let v = load_s(src).unwrap();
+        let steps = get(&v, "t.steps").as_array().unwrap();
+        assert_eq!(steps[0].get("run").unwrap().as_str(), Some("echo ${X}"));
+        assert_eq!(steps[1].get("run").unwrap().as_str(), Some("multi\n"));
+    }
+
+    #[test]
+    fn keeps_non_ascii_text() {
+        let src = "$x = \"é\"\n[t]\ns = \"naïve ${x} — ✓\"\n";
+        let v = load_s(src).unwrap();
+        assert_eq!(get_str(&v, "t.s"), "naïve é — ✓");
+    }
+
+    #[test]
+    fn statements_run_for_their_effect_only() {
+        // `fetch` of an unreachable URL fails: proof the statement ran.
+        let src = "[t]\nfetch('http://127.0.0.1:1/nothing', 'x')\nk = 1\n";
+        let err = load_s(src).unwrap_err();
+        assert!(err.message.contains("fetch()"), "{}", err.message);
+        assert_eq!(err.line, 2);
+    }
+
+    #[test]
+    fn rejects_unknown_keyword_arguments() {
+        let src = "[t]\nk = glob('*', recursive = true)\n";
+        let err = load_s(src).unwrap_err();
+        assert!(err.message.contains("keyword"), "{}", err.message);
+    }
+
+    #[test]
+    fn reports_invalid_plain_toml_at_its_line() {
+        let src = "[t]\na = 1\nb = \"x\" \"y\"\n";
+        let err = load_s(src).unwrap_err();
+        assert_eq!(err.line, 3, "{err}");
+    }
+
+    #[test]
+    fn reports_unterminated_strings_where_they_start() {
+        let err = load_s("[t]\na = '''\nnever closed\n").unwrap_err();
+        assert_eq!((err.line, err.col), (2, 5), "{err}");
+    }
+
+    #[test]
+    fn path_builtins() {
+        let src = r#"
+[p]
+base = basename("a/b/c.txt")
+dir = dirname("a/b/c.txt")
+top = dirname("c.txt")
+joined = join("a", "b/", "c")
+absolute = join("a", "/b")
+replaced = replace("a-b-c", "-", "/")
+here = exists("does-not-exist-anywhere")
+sh = which("definitely-not-a-program-x9") == ""
+"#;
+        let v = load_s(src).unwrap();
+        assert_eq!(get_str(&v, "p.base"), "c.txt");
+        assert_eq!(get_str(&v, "p.dir"), "a/b");
+        assert_eq!(get_str(&v, "p.top"), ".");
+        assert_eq!(get_str(&v, "p.joined"), "a/b/c");
+        assert_eq!(get_str(&v, "p.absolute"), "/b");
+        assert_eq!(get_str(&v, "p.replaced"), "a/b/c");
+        assert_eq!(get(&v, "p.here").as_bool(), Some(false));
+        assert_eq!(get(&v, "p.sh").as_bool(), Some(true));
+    }
+
+    #[test]
+    fn includes_merge_and_see_earlier_variables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("neomake.tomlx"),
+            "$dave = \"bin/dave\"\ninclude = [\"tests/*.tomlx\"]\n[tasks.a]\ncommand = \"a\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/one.tomlx"),
+            "[tasks.b]\ncommand = \"${dave} b\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/two.tomlx"),
+            "include = 'tests/one.tomlx'\n[tasks.c]\ncommand = 'c'\n",
+        )
+        .unwrap();
+        let loaded = load_documents(&root.join("neomake.tomlx")).unwrap();
+        assert_eq!(loaded.documents.len(), 3, "one.tomlx is loaded once");
+        let v = loaded.merged().unwrap();
+        assert_eq!(get_str(&v, "tasks.a.command"), "a");
+        assert_eq!(get_str(&v, "tasks.b.command"), "bin/dave b");
+        assert_eq!(get_str(&v, "tasks.c.command"), "c");
+        assert!(v.get("include").is_none());
+    }
+
+    #[test]
+    fn include_conflicts_name_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("neomake.toml"),
+            "include = 'more.toml'\n[tasks.a]\ncommand = 'a'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("more.toml"), "[tasks.a]\ncommand = 'b'\n").unwrap();
+        let err = load(&root.join("neomake.toml")).unwrap_err();
+        assert!(err.message.contains("tasks.a.command"), "{}", err.message);
+        assert!(err.message.contains("neomake.toml"), "{}", err.message);
+        assert!(err.file.ends_with("more.toml"));
+    }
+
+    #[test]
+    fn missing_include_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("neomake.toml");
+        std::fs::write(&path, "include = 'nope.toml'\n").unwrap();
+        let err = load(&path).unwrap_err();
+        assert!(err.message.contains("does not exist"), "{}", err.message);
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn bare_config_paths_have_the_current_directory_as_root() {
+        let scope = Scope::new(neomake_core::project_root_for(Path::new("neomake.tomlx")));
+        assert_eq!(scope.root, PathBuf::from("."));
+        let v = load_s("[t]\nout = exec('echo hi')\n").unwrap();
+        assert_eq!(get_str(&v, "t.out"), "hi");
     }
 
     #[test]

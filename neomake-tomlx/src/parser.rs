@@ -3,12 +3,12 @@
 //! Precedence (lowest to highest):
 //!
 //! ```text
-//! or:      a || b
-//! and:     a && b
+//! or:       a || b
+//! and:      a && b
 //! equality: a == b | a != b
 //! additive: a + b
 //! unary:    !a | -a
-//! primary:  literal | var | call | array | if-expr | ( expr )
+//! primary:  literal | var | call | array | inline table | if-expr | ( expr )
 //! ```
 //!
 //! The parser consumes the token stream produced by [`crate::lexer`]
@@ -62,14 +62,22 @@ pub enum Expr {
     Float(f64),
     /// Boolean literal.
     Bool(bool),
-    /// A single-quoted literal string (no interpolation).
+    /// A literal string, or a basic string without interpolation.
     LitStr(String),
-    /// A double-quoted string with zero or more interpolated segments.
+    /// A basic string with one or more interpolated segments.
     TemplateStr(Vec<StringPart>),
     /// An array literal `[a, b, c]`.
     Array(Vec<Expr>),
-    /// `$name` or `${name}` — variable reference.
-    Var(String),
+    /// An inline table `{ a = 1, b.c = "x" }`. Each entry's key is the
+    /// list of its dotted parts.
+    Table(Vec<(Vec<String>, Expr)>),
+    /// `$name`, `${name}` or, inside an expression, bare `name`.
+    Var {
+        /// Variable name.
+        name: String,
+        /// Where the reference is written.
+        span: Span,
+    },
     /// `ident(arg, ...)` — built-in function call.
     Call {
         /// Function name.
@@ -118,15 +126,27 @@ pub enum Expr {
 /// Fails if the stream is empty, has trailing tokens, or contains
 /// syntax errors.
 pub fn parse_expr(tokens: Vec<SpannedToken>) -> Result<Expr, TomlxError> {
-    let mut p = Parser { tokens, pos: 0 };
+    parse_expr_at(tokens, None)
+}
+
+/// Like [`parse_expr`], with `start` locating an empty expression.
+pub fn parse_expr_at(tokens: Vec<SpannedToken>, start: Option<&Span>) -> Result<Expr, TomlxError> {
+    let end = tokens
+        .last()
+        .map(|t| t.span.clone())
+        .or_else(|| start.cloned())
+        .unwrap_or_else(|| Span::new("", 0, 0));
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        end,
+    };
     let expr = p.parse_expr()?;
     if let Some(tok) = p.tokens.get(p.pos) {
-        return Err(TomlxError::new(
-            &tok.span.file,
-            tok.span.line,
-            tok.span.col,
-            format!("unexpected trailing token: {:?}", tok.token),
-        ));
+        return Err(tok.span.error(format!(
+            "unexpected {} after the expression",
+            describe(&tok.token)
+        )));
     }
     Ok(expr)
 }
@@ -134,11 +154,17 @@ pub fn parse_expr(tokens: Vec<SpannedToken>) -> Result<Expr, TomlxError> {
 struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
+    /// Where "end of input" is reported.
+    end: Span,
 }
 
 impl Parser {
     fn peek(&self) -> Option<&SpannedToken> {
         self.tokens.get(self.pos)
+    }
+
+    fn peek_token(&self) -> Option<&Token> {
+        self.peek().map(|t| &t.token)
     }
 
     fn bump(&mut self) -> Option<SpannedToken> {
@@ -167,16 +193,12 @@ impl Parser {
             Some(t) if discriminant_eq(&t.token, kind) => {
                 Ok(self.bump().expect("peeked token must exist"))
             }
-            Some(t) => Err(TomlxError::new(
-                &t.span.file,
-                t.span.line,
-                t.span.col,
-                format!("expected {what}, got {:?}", t.token),
-            )),
-            None => Err(TomlxError::at_unknown(
-                std::path::PathBuf::new(),
-                format!("expected {what}, found end of input"),
-            )),
+            Some(t) => Err(t
+                .span
+                .error(format!("expected {what}, got {}", describe(&t.token)))),
+            None => Err(self
+                .end
+                .error(format!("expected {what}, found end of input"))),
         }
     }
 
@@ -213,23 +235,19 @@ impl Parser {
     fn parse_eq(&mut self) -> Result<Expr, TomlxError> {
         let mut lhs = self.parse_add()?;
         loop {
-            if self.eat(&Token::EqEq) {
-                let rhs = self.parse_add()?;
-                lhs = Expr::Binary {
-                    op: BinOp::Eq,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                };
+            let op = if self.eat(&Token::EqEq) {
+                BinOp::Eq
             } else if self.eat(&Token::NotEq) {
-                let rhs = self.parse_add()?;
-                lhs = Expr::Binary {
-                    op: BinOp::Ne,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                };
+                BinOp::Ne
             } else {
                 break;
-            }
+            };
+            let rhs = self.parse_add()?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -268,12 +286,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, TomlxError> {
         let tok = match self.bump() {
             Some(t) => t,
-            None => {
-                return Err(TomlxError::at_unknown(
-                    std::path::PathBuf::new(),
-                    "expected expression, found end of input",
-                ))
-            }
+            None => return Err(self.end.error("expected an expression, found end of input")),
         };
         match tok.token {
             Token::Int(n) => Ok(Expr::Int(n)),
@@ -281,75 +294,80 @@ impl Parser {
             Token::Bool(b) => Ok(Expr::Bool(b)),
             Token::LitStr(s) => Ok(Expr::LitStr(s)),
             Token::TemplateStr(segs) => build_template(segs, &tok.span),
-            Token::VarRef(name) => Ok(Expr::Var(name)),
+            Token::VarRef(name) => Ok(Expr::Var {
+                name,
+                span: tok.span,
+            }),
             Token::LParen => {
                 let inner = self.parse_expr()?;
                 self.expect(&Token::RParen, "`)`")?;
                 Ok(inner)
             }
             Token::LBracket => self.parse_array_tail(),
+            Token::LBrace => self.parse_table_tail(),
             Token::If => self.parse_if_tail(),
             Token::Ident(name) => {
                 if self.eat(&Token::LParen) {
-                    let mut args = Vec::new();
-                    if !matches!(self.peek().map(|t| &t.token), Some(Token::RParen)) {
-                        loop {
-                            // lookahead: Ident Eq means keyword arg
-                            let is_kwarg = matches!(
-                                (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)),
-                                (
-                                    Some(SpannedToken {
-                                        token: Token::Ident(_),
-                                        ..
-                                    }),
-                                    Some(SpannedToken {
-                                        token: Token::Eq,
-                                        ..
-                                    })
-                                )
-                            );
-                            if is_kwarg {
-                                let kw_tok = self.bump().unwrap();
-                                let kw_name = match kw_tok.token {
-                                    Token::Ident(n) => n,
-                                    _ => unreachable!(),
-                                };
-                                self.bump(); // eat Eq
-                                let value = self.parse_expr()?;
-                                args.push(Expr::KeywordArg {
-                                    name: kw_name,
-                                    value: Box::new(value),
-                                });
-                            } else {
-                                args.push(self.parse_expr()?);
-                            }
-                            if !self.eat(&Token::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    self.expect(&Token::RParen, "`)`")?;
+                    let args = self.parse_call_args()?;
                     Ok(Expr::Call {
                         name,
                         args,
                         span: tok.span,
                     })
                 } else {
-                    // Bare identifiers resolve as variable references.
-                    // The `$` sigil is required at the *document* level
-                    // to flag a TOMLX line, but once inside an
-                    // expression (e.g. an `${...}` interpolation or the
-                    // RHS of a `$var = ...` decl) the sigil is redundant.
-                    Ok(Expr::Var(name))
+                    // Inside an expression the `$` sigil is redundant:
+                    // a bare identifier is a variable reference.
+                    Ok(Expr::Var {
+                        name,
+                        span: tok.span,
+                    })
                 }
             }
-            other => Err(TomlxError::new(
-                &tok.span.file,
-                tok.span.line,
-                tok.span.col,
-                format!("unexpected token: {other:?}"),
-            )),
+            other => Err(tok
+                .span
+                .error(format!("expected an expression, got {}", describe(&other)))),
         }
+    }
+
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, TomlxError> {
+        let mut args = Vec::new();
+        if self.eat(&Token::RParen) {
+            return Ok(args);
+        }
+        loop {
+            let is_kwarg = matches!(
+                (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)),
+                (
+                    Some(SpannedToken {
+                        token: Token::Ident(_),
+                        ..
+                    }),
+                    Some(SpannedToken {
+                        token: Token::Eq,
+                        ..
+                    })
+                )
+            );
+            if is_kwarg {
+                let kw_name = match self.bump().map(|t| t.token) {
+                    Some(Token::Ident(n)) => n,
+                    _ => unreachable!("checked by the lookahead"),
+                };
+                self.bump(); // `=`
+                let value = self.parse_expr()?;
+                args.push(Expr::KeywordArg {
+                    name: kw_name,
+                    value: Box::new(value),
+                });
+            } else {
+                args.push(self.parse_expr()?);
+            }
+            if !self.eat(&Token::Comma) || self.peek_token() == Some(&Token::RParen) {
+                break;
+            }
+        }
+        self.expect(&Token::RParen, "`)` or `,`")?;
+        Ok(args)
     }
 
     fn parse_array_tail(&mut self) -> Result<Expr, TomlxError> {
@@ -370,15 +388,68 @@ impl Parser {
         }
     }
 
+    /// `{ key = expr, a.b = expr }` after the `{`. Unlike TOML 1.0, the
+    /// entries may span lines and end with a trailing comma.
+    fn parse_table_tail(&mut self) -> Result<Expr, TomlxError> {
+        let mut entries = Vec::new();
+        if self.eat(&Token::RBrace) {
+            return Ok(Expr::Table(entries));
+        }
+        loop {
+            let mut key = vec![self.parse_key_part()?];
+            while self.eat(&Token::Dot) {
+                key.push(self.parse_key_part()?);
+            }
+            self.expect(&Token::Eq, "`=` after an inline-table key")?;
+            let value = self.parse_expr()?;
+            entries.push((key, value));
+            if self.eat(&Token::Comma) {
+                if self.eat(&Token::RBrace) {
+                    return Ok(Expr::Table(entries));
+                }
+                continue;
+            }
+            self.expect(&Token::RBrace, "`}` or `,`")?;
+            return Ok(Expr::Table(entries));
+        }
+    }
+
+    fn parse_key_part(&mut self) -> Result<String, TomlxError> {
+        let tok = match self.bump() {
+            Some(t) => t,
+            None => return Err(self.end.error("expected a key, found end of input")),
+        };
+        match tok.token {
+            Token::Ident(name) => Ok(name),
+            Token::Int(n) => Ok(n.to_string()),
+            Token::Bool(b) => Ok(b.to_string()),
+            Token::If => Ok("if".into()),
+            Token::Else => Ok("else".into()),
+            Token::LitStr(s) => Ok(s),
+            Token::TemplateStr(segs) => match segs.as_slice() {
+                [StrSegment::Lit(s)] => Ok(s.clone()),
+                _ => Err(tok.span.error("a key cannot be interpolated")),
+            },
+            other => Err(tok
+                .span
+                .error(format!("expected a key, got {}", describe(&other)))),
+        }
+    }
+
     fn parse_if_tail(&mut self) -> Result<Expr, TomlxError> {
         let cond = self.parse_expr()?;
-        self.expect(&Token::LBrace, "`{` after if condition")?;
+        self.expect(&Token::LBrace, "`{` after the if condition")?;
         let then_branch = self.parse_expr()?;
-        self.expect(&Token::RBrace, "`}` to close if-then branch")?;
+        self.expect(&Token::RBrace, "`}` to close the if branch")?;
         self.expect(&Token::Else, "`else`")?;
-        self.expect(&Token::LBrace, "`{` after else")?;
-        let else_branch = self.parse_expr()?;
-        self.expect(&Token::RBrace, "`}` to close else branch")?;
+        let else_branch = if self.eat(&Token::If) {
+            self.parse_if_tail()?
+        } else {
+            self.expect(&Token::LBrace, "`{` or `if` after else")?;
+            let e = self.parse_expr()?;
+            self.expect(&Token::RBrace, "`}` to close the else branch")?;
+            e
+        };
         Ok(Expr::If {
             cond: Box::new(cond),
             then_branch: Box::new(then_branch),
@@ -396,7 +467,7 @@ fn build_template(segs: Vec<StrSegment>, span: &Span) -> Result<Expr, TomlxError
             StrSegment::Interp(raw) => {
                 has_interp = true;
                 let inner_tokens = tokenize(&raw, span)?;
-                let inner = parse_expr(inner_tokens)?;
+                let inner = parse_expr_at(inner_tokens, Some(span))?;
                 parts.push(StringPart::Interp(Box::new(inner)));
             }
         }
@@ -419,6 +490,36 @@ fn discriminant_eq(a: &Token, b: &Token) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
 }
 
+/// A token as a diagnostic names it.
+fn describe(token: &Token) -> String {
+    match token {
+        Token::Ident(s) => format!("`{s}`"),
+        Token::Int(n) => format!("`{n}`"),
+        Token::Float(f) => format!("`{f}`"),
+        Token::Bool(b) => format!("`{b}`"),
+        Token::TemplateStr(_) | Token::LitStr(_) => "a string".into(),
+        Token::VarRef(name) => format!("`${name}`"),
+        Token::If => "`if`".into(),
+        Token::Else => "`else`".into(),
+        Token::LParen => "`(`".into(),
+        Token::RParen => "`)`".into(),
+        Token::LBrace => "`{`".into(),
+        Token::RBrace => "`}`".into(),
+        Token::LBracket => "`[`".into(),
+        Token::RBracket => "`]`".into(),
+        Token::Comma => "`,`".into(),
+        Token::Dot => "`.`".into(),
+        Token::Plus => "`+`".into(),
+        Token::Minus => "`-`".into(),
+        Token::EqEq => "`==`".into(),
+        Token::NotEq => "`!=`".into(),
+        Token::AndAnd => "`&&`".into(),
+        Token::OrOr => "`||`".into(),
+        Token::Bang => "`!`".into(),
+        Token::Eq => "`=`".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,7 +536,6 @@ mod tests {
     fn parses_precedence() {
         // `a || b && c == d` → a || (b && (c == d))
         let e = parse("1 == 2 && 3 == 4 || 5 == 6").unwrap();
-        // Top-level must be Or.
         match e {
             Expr::Binary { op: BinOp::Or, .. } => {}
             other => panic!("expected top-level ||, got {other:?}"),
@@ -446,6 +546,15 @@ mod tests {
     fn parses_if_expr() {
         let e = parse("if true { 1 } else { 2 }").unwrap();
         assert!(matches!(e, Expr::If { .. }));
+    }
+
+    #[test]
+    fn parses_else_if_chains() {
+        let e = parse(r#"if a { 1 } else if b { 2 } else { 3 }"#).unwrap();
+        match e {
+            Expr::If { else_branch, .. } => assert!(matches!(*else_branch, Expr::If { .. })),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -467,7 +576,9 @@ mod tests {
             Expr::TemplateStr(parts) => {
                 assert_eq!(parts.len(), 3);
                 assert!(matches!(&parts[0], StringPart::Lit(s) if s == "hello "));
-                assert!(matches!(&parts[1], StringPart::Interp(e) if matches!(**e, Expr::Var(_))));
+                assert!(
+                    matches!(&parts[1], StringPart::Interp(e) if matches!(**e, Expr::Var { .. }))
+                );
                 assert!(matches!(&parts[2], StringPart::Lit(s) if s == "!"));
             }
             other => panic!("{other:?}"),
@@ -484,17 +595,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_inline_tables_with_dotted_keys() {
+        let e = parse("{ a = 1, b.c = \"x\",\n 'd e' = [2], }").unwrap();
+        match e {
+            Expr::Table(entries) => {
+                let keys: Vec<Vec<String>> = entries.into_iter().map(|(k, _)| k).collect();
+                assert_eq!(
+                    keys,
+                    vec![
+                        vec!["a".to_string()],
+                        vec!["b".to_string(), "c".to_string()],
+                        vec!["d e".to_string()],
+                    ]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn reports_where_input_ended() {
+        let err = parse("[1, 2").unwrap_err();
+        assert_eq!((err.line, err.col), (1, 5));
+        assert!(err.message.contains("end of input"), "{}", err.message);
+    }
+
+    #[test]
     fn parses_keyword_args_in_call() {
         let e = parse(r#"git("repo", "tag", "dest", submodules = true, depth = 1)"#).unwrap();
         match e {
             Expr::Call { name, args, .. } => {
                 assert_eq!(name, "git");
                 assert_eq!(args.len(), 5);
-                // first 3 are positional strings
                 assert!(matches!(&args[0], Expr::LitStr(_)));
                 assert!(matches!(&args[1], Expr::LitStr(_)));
                 assert!(matches!(&args[2], Expr::LitStr(_)));
-                // last 2 are keyword args
                 match &args[3] {
                     Expr::KeywordArg { name, value } => {
                         assert_eq!(name, "submodules");

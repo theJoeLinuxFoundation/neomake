@@ -157,6 +157,9 @@ Set `NEOMAKE_LOG=debug` to turn on `tracing` diagnostics.
 | Command execution     | `exec("git rev-parse HEAD")`                                |
 | Git clone             | `git("github:owner/repo", "v1.0.0", "dest/%")`               |
 | File download         | `fetch("https://url.com/file", "dest/%")`                    |
+| Path helpers          | `exists("x")`, `which("qemu-system-x86_64")`, `join(a, b)`  |
+| Split configurations  | `include = ["tests/*.tomlx"]`                               |
+| Shell left untouched  | `command = 'echo "${HOME}" $?'` (literal strings)           |
 
 See [`docs/tomlx-spec.md`](docs/tomlx-spec.md) for the full grammar and
 semantics, and [`examples/advanced.tomlx`](examples/advanced.tomlx) for

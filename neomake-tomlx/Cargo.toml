@@ -22,8 +22,6 @@ url = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 neomake-core = { path = "../neomake-core" }
-
-[target.'cfg(windows)'.dependencies]
 which = { workspace = true }
 
 [dev-dependencies]
