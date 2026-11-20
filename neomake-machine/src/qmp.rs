@@ -1,6 +1,7 @@
 //! QEMU's machine protocol, for screenshots.
 
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]

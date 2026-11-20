@@ -574,7 +574,7 @@ impl Machine {
         let r = self
             .run_line(
                 &format!(
-                    "base64 -d {tmp} > {}; __nm=$?; rm -f {tmp}; (exit $__nm)",
+                    "base64 -d < {tmp} > {}; __nm=$?; rm -f {tmp}; (exit $__nm)",
                     quote(path)
                 ),
                 remaining(deadline),
