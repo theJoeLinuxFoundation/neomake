@@ -1,3 +1,9 @@
+//! Records of assets that `git()` and `fetch()` brought into a project.
+//!
+//! The manifest maps each destination path to where it came from and
+//! what it was (a commit or a content hash), so the cache can key a task
+//! on an asset without hashing a whole checkout.
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

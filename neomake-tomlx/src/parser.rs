@@ -298,8 +298,14 @@ impl Parser {
                             let is_kwarg = matches!(
                                 (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)),
                                 (
-                                    Some(SpannedToken { token: Token::Ident(_), .. }),
-                                    Some(SpannedToken { token: Token::Eq, .. })
+                                    Some(SpannedToken {
+                                        token: Token::Ident(_),
+                                        ..
+                                    }),
+                                    Some(SpannedToken {
+                                        token: Token::Eq,
+                                        ..
+                                    })
                                 )
                             );
                             if is_kwarg {

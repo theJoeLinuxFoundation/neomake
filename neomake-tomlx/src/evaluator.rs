@@ -514,7 +514,7 @@ fn call_builtin(
     span: &Span,
 ) -> Result<toml::Value, TomlxError> {
     let mk_err = |msg: String| TomlxError::new(&span.file, span.line, span.col, msg);
-    
+
     let mut positional = Vec::new();
     let mut kwargs = BTreeMap::new();
     for arg in args {
@@ -640,7 +640,10 @@ fn call_builtin(
         }
         "git" => {
             if positional.len() != 3 {
-                return Err(mk_err(format!("git() expects 3 positional arguments, got {}", positional.len())));
+                return Err(mk_err(format!(
+                    "git() expects 3 positional arguments, got {}",
+                    positional.len()
+                )));
             }
             let repo = expect_string(&positional[0], "git() repo", &mk_err)?;
             let tag = expect_string(&positional[1], "git() tag", &mk_err)?;
@@ -665,17 +668,23 @@ fn call_builtin(
                 .map_err(|e| mk_err(format!("git() error: {e}")))?;
 
             let mut manifest = neomake_core::asset::AssetManifest::load(&scope.base_dir);
-            manifest.add(path.clone(), neomake_core::asset::AssetRecord {
-                kind: neomake_core::asset::AssetKind::Git { commit_sha: sha },
-                source: repo,
-            });
+            manifest.add(
+                path.clone(),
+                neomake_core::asset::AssetRecord {
+                    kind: neomake_core::asset::AssetKind::Git { commit_sha: sha },
+                    source: repo,
+                },
+            );
             manifest.save(&scope.base_dir);
 
             Ok(toml::Value::String(path.to_string_lossy().to_string()))
         }
         "fetch" => {
             if positional.len() != 2 {
-                return Err(mk_err(format!("fetch() expects 2 positional arguments, got {}", positional.len())));
+                return Err(mk_err(format!(
+                    "fetch() expects 2 positional arguments, got {}",
+                    positional.len()
+                )));
             }
             let url = expect_string(&positional[0], "fetch() url", &mk_err)?;
             let dest_template = expect_string(&positional[1], "fetch() dest", &mk_err)?;
@@ -701,14 +710,20 @@ fn call_builtin(
             let basename = crate::fetch::extract_basename(&url);
             let dest = crate::fetch::resolve_wildcard(&dest_template, &basename, alias.as_deref());
 
-            let (path, sha) = crate::fetch::http_fetch(&url, &dest, sha256_expected.as_deref(), extract)
-                .map_err(|e| mk_err(format!("fetch() error: {e}")))?;
+            let (path, sha) =
+                crate::fetch::http_fetch(&url, &dest, sha256_expected.as_deref(), extract)
+                    .map_err(|e| mk_err(format!("fetch() error: {e}")))?;
 
             let mut manifest = neomake_core::asset::AssetManifest::load(&scope.base_dir);
-            manifest.add(path.clone(), neomake_core::asset::AssetRecord {
-                kind: neomake_core::asset::AssetKind::Fetch { content_sha256: sha },
-                source: url,
-            });
+            manifest.add(
+                path.clone(),
+                neomake_core::asset::AssetRecord {
+                    kind: neomake_core::asset::AssetKind::Fetch {
+                        content_sha256: sha,
+                    },
+                    source: url,
+                },
+            );
             manifest.save(&scope.base_dir);
 
             Ok(toml::Value::String(path.to_string_lossy().to_string()))

@@ -1,3 +1,7 @@
+//! The downloads behind `git()` and `fetch()`: cloning a repository at a
+//! revision, and fetching a URL with an optional checksum and archive
+//! extraction.
+
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_LENGTH;
 use sha2::{Digest, Sha256};
@@ -65,7 +69,12 @@ impl ProgressBar {
             for _ in 0..14 {
                 bar.push('—');
             }
-            write!(out, "\r[{}] {:.2} MB {} ETA ??:??", bar, downloaded_mb, speed_str).unwrap();
+            write!(
+                out,
+                "\r[{}] {:.2} MB {} ETA ??:??",
+                bar, downloaded_mb, speed_str
+            )
+            .unwrap();
         }
         out.flush().unwrap();
     }
@@ -118,7 +127,10 @@ pub fn http_fetch(
         .map_err(|e| format!("http request failed: {e}"))?;
 
     if !response.status().is_success() {
-        return Err(format!("http request failed with status: {}", response.status()));
+        return Err(format!(
+            "http request failed with status: {}",
+            response.status()
+        ));
     }
 
     let total_size = response
@@ -131,17 +143,21 @@ pub fn http_fetch(
     let mut temp_path = dest_path.to_path_buf();
     temp_path.set_extension("downloading");
 
-    let mut file = File::create(&temp_path).map_err(|e| format!("failed to create temp file: {e}"))?;
+    let mut file =
+        File::create(&temp_path).map_err(|e| format!("failed to create temp file: {e}"))?;
     let mut buffer = [0; 32 * 1024]; // 32KB chunk size
     let mut hasher = Sha256::new();
 
     println!("Downloading {}...", url);
     loop {
-        let n = response.read(&mut buffer).map_err(|e| format!("download error: {e}"))?;
+        let n = response
+            .read(&mut buffer)
+            .map_err(|e| format!("download error: {e}"))?;
         if n == 0 {
             break;
         }
-        file.write_all(&buffer[..n]).map_err(|e| format!("write error: {e}"))?;
+        file.write_all(&buffer[..n])
+            .map_err(|e| format!("write error: {e}"))?;
         hasher.update(&buffer[..n]);
         pb.update(n as u64);
     }
@@ -151,7 +167,9 @@ pub fn http_fetch(
     if let Some(expected) = sha256_expected {
         if expected != computed_hash {
             let _ = std::fs::remove_file(&temp_path);
-            return Err(format!("hash mismatch! expected {expected}, got {computed_hash}"));
+            return Err(format!(
+                "hash mismatch! expected {expected}, got {computed_hash}"
+            ));
         }
     }
 
@@ -161,16 +179,24 @@ pub fn http_fetch(
         let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
         let ext = dest_path.extension().and_then(|s| s.to_str()).unwrap_or("");
         println!("Extracting to {}...", parent.display());
-        if dest_path.to_string_lossy().ends_with(".tar.gz") || dest_path.to_string_lossy().ends_with(".tgz") {
-            let tar_gz = File::open(dest_path).map_err(|e| format!("failed to open tarball: {e}"))?;
+        if dest_path.to_string_lossy().ends_with(".tar.gz")
+            || dest_path.to_string_lossy().ends_with(".tgz")
+        {
+            let tar_gz =
+                File::open(dest_path).map_err(|e| format!("failed to open tarball: {e}"))?;
             let tar = flate2::read::GzDecoder::new(tar_gz);
             let mut archive = tar::Archive::new(tar);
-            archive.unpack(parent).map_err(|e| format!("failed to extract tar.gz: {e}"))?;
+            archive
+                .unpack(parent)
+                .map_err(|e| format!("failed to extract tar.gz: {e}"))?;
         } else if dest_path.to_string_lossy().ends_with(".tar.xz") {
-            let tar_xz = File::open(dest_path).map_err(|e| format!("failed to open tar.xz: {e}"))?;
+            let tar_xz =
+                File::open(dest_path).map_err(|e| format!("failed to open tar.xz: {e}"))?;
             let tar = xz2::read::XzDecoder::new(tar_xz);
             let mut archive = tar::Archive::new(tar);
-            archive.unpack(parent).map_err(|e| format!("failed to extract tar.xz: {e}"))?;
+            archive
+                .unpack(parent)
+                .map_err(|e| format!("failed to extract tar.xz: {e}"))?;
         } else {
             return Err(format!("unsupported archive extension: {}", ext));
         }
@@ -204,11 +230,14 @@ pub fn git_clone(
     depth: Option<u32>,
 ) -> Result<(PathBuf, String), String> {
     let dest_path = Path::new(dest_str);
-    
+
     if dest_path.exists() {
-        let r = git2::Repository::open(dest_path).map_err(|e| format!("failed to open existing repo: {e}"))?;
+        let r = git2::Repository::open(dest_path)
+            .map_err(|e| format!("failed to open existing repo: {e}"))?;
         let head = r.head().map_err(|e| format!("failed to get HEAD: {e}"))?;
-        let commit = head.peel_to_commit().map_err(|e| format!("failed to peel commit: {e}"))?;
+        let commit = head
+            .peel_to_commit()
+            .map_err(|e| format!("failed to peel commit: {e}"))?;
         return Ok((dest_path.to_path_buf(), commit.id().to_string()));
     }
 
@@ -216,23 +245,36 @@ pub fn git_clone(
 
     println!("Cloning {}...", url);
     let mut builder = git2::build::RepoBuilder::new();
-    let mut fetch_opts = git2::FetchOptions::new();
-    if let Some(d) = depth {
+    let fetch_opts = git2::FetchOptions::new();
+    if depth.is_some() {
         println!("note: libgit2 shallow clones are not fully supported, doing full clone.");
     }
-    
-    let repo_obj = builder.fetch_options(fetch_opts).clone(&url, dest_path).map_err(|e| format!("git clone failed: {e}"))?;
 
-    let obj = repo_obj.revparse_single(tag).map_err(|e| format!("failed to find tag/rev {}: {}", tag, e))?;
-    repo_obj.checkout_tree(&obj, None).map_err(|e| format!("checkout failed: {e}"))?;
-    repo_obj.set_head_detached(obj.id()).map_err(|e| format!("set head failed: {e}"))?;
+    let repo_obj = builder
+        .fetch_options(fetch_opts)
+        .clone(&url, dest_path)
+        .map_err(|e| format!("git clone failed: {e}"))?;
+
+    let obj = repo_obj
+        .revparse_single(tag)
+        .map_err(|e| format!("failed to find tag/rev {}: {}", tag, e))?;
+    repo_obj
+        .checkout_tree(&obj, None)
+        .map_err(|e| format!("checkout failed: {e}"))?;
+    repo_obj
+        .set_head_detached(obj.id())
+        .map_err(|e| format!("set head failed: {e}"))?;
 
     let commit_sha = obj.id().to_string();
 
     if submodules {
-        for mut sub in repo_obj.submodules().map_err(|e| format!("submodules error: {e}"))? {
+        for mut sub in repo_obj
+            .submodules()
+            .map_err(|e| format!("submodules error: {e}"))?
+        {
             let mut sub_opts = git2::SubmoduleUpdateOptions::new();
-            sub.update(true, Some(&mut sub_opts)).map_err(|e| format!("submodule update failed: {e}"))?;
+            sub.update(true, Some(&mut sub_opts))
+                .map_err(|e| format!("submodule update failed: {e}"))?;
         }
     }
 
@@ -254,21 +296,51 @@ mod tests {
 
     #[test]
     fn test_resolve_git_url() {
-        assert_eq!(resolve_git_url("https://github.com/foo/bar"), "https://github.com/foo/bar");
-        assert_eq!(resolve_git_url("git@github.com:foo/bar.git"), "git@github.com:foo/bar.git");
-        assert_eq!(resolve_git_url("git://github.com/foo/bar"), "git://github.com/foo/bar");
+        assert_eq!(
+            resolve_git_url("https://github.com/foo/bar"),
+            "https://github.com/foo/bar"
+        );
+        assert_eq!(
+            resolve_git_url("git@github.com:foo/bar.git"),
+            "git@github.com:foo/bar.git"
+        );
+        assert_eq!(
+            resolve_git_url("git://github.com/foo/bar"),
+            "git://github.com/foo/bar"
+        );
 
-        assert_eq!(resolve_git_url("github:foo/bar"), "https://github.com/foo/bar");
+        assert_eq!(
+            resolve_git_url("github:foo/bar"),
+            "https://github.com/foo/bar"
+        );
         assert_eq!(resolve_git_url("gh:foo/bar"), "https://github.com/foo/bar");
-        assert_eq!(resolve_git_url("gitlab:foo/bar"), "https://gitlab.com/foo/bar");
+        assert_eq!(
+            resolve_git_url("gitlab:foo/bar"),
+            "https://gitlab.com/foo/bar"
+        );
         assert_eq!(resolve_git_url("gl:foo/bar"), "https://gitlab.com/foo/bar");
-        assert_eq!(resolve_git_url("codeberg:foo/bar"), "https://codeberg.org/foo/bar");
-        assert_eq!(resolve_git_url("cb:foo/bar"), "https://codeberg.org/foo/bar");
-        assert_eq!(resolve_git_url("bitbucket:foo/bar"), "https://bitbucket.org/foo/bar");
-        assert_eq!(resolve_git_url("bb:foo/bar"), "https://bitbucket.org/foo/bar");
+        assert_eq!(
+            resolve_git_url("codeberg:foo/bar"),
+            "https://codeberg.org/foo/bar"
+        );
+        assert_eq!(
+            resolve_git_url("cb:foo/bar"),
+            "https://codeberg.org/foo/bar"
+        );
+        assert_eq!(
+            resolve_git_url("bitbucket:foo/bar"),
+            "https://bitbucket.org/foo/bar"
+        );
+        assert_eq!(
+            resolve_git_url("bb:foo/bar"),
+            "https://bitbucket.org/foo/bar"
+        );
 
         assert_eq!(resolve_git_url("foo/bar"), "https://github.com/foo/bar");
 
-        assert_eq!(resolve_git_url("unknown:foo/bar"), "https://github.com/unknown:foo/bar");
+        assert_eq!(
+            resolve_git_url("unknown:foo/bar"),
+            "https://github.com/unknown:foo/bar"
+        );
     }
 }

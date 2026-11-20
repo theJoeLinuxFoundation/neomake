@@ -23,13 +23,13 @@
 #![warn(missing_docs)]
 #![deny(clippy::all)]
 
+pub mod asset;
 pub mod cache;
 pub mod dag;
 pub mod error;
 pub mod executor;
 pub mod shell;
 pub mod task;
-pub mod asset;
 
 pub use cache::{Cache, CacheEntry, CacheStatus, OutputRecord};
 pub use dag::Dag;
