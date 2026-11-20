@@ -886,6 +886,7 @@ dependencies = [
  "anyhow",
  "clap",
  "neomake-core",
+ "neomake-machine",
  "neomake-tomlx",
  "num_cpus",
  "pretty_assertions",
@@ -919,6 +920,22 @@ dependencies = [
  "toml",
  "tracing",
  "walkdir",
+ "which",
+]
+
+[[package]]
+name = "neomake-machine"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "libc",
+ "neomake-core",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "which",
 ]
 

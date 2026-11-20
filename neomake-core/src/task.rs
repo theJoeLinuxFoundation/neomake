@@ -154,6 +154,15 @@ pub struct Task {
     pub variant: Option<Variant>,
     /// Services it uses (see [`crate::services`]).
     pub services: Vec<String>,
+    /// The machine a test's steps run in (see [`crate::machine`]).
+    pub machine: Option<crate::machine::MachineSpec>,
+    /// Start the machine and wait for it to boot before the first step.
+    pub autoboot: bool,
+    /// Commands run in the machine after every boot.
+    pub on_boot: Option<String>,
+    /// Steps run in the machine when a step fails, to gather what shows
+    /// why; their failures are only logged.
+    pub on_failure: Vec<Step>,
 }
 
 /// One combination of a matrix's values.
@@ -195,6 +204,10 @@ impl Task {
             prelude: None,
             variant: None,
             services: Vec::new(),
+            machine: None,
+            autoboot: true,
+            on_boot: None,
+            on_failure: Vec::new(),
         }
     }
 

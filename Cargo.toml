@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["neomake", "neomake-core", "neomake-tomlx"]
+members = ["neomake", "neomake-core", "neomake-machine", "neomake-tomlx"]
 
 [workspace.package]
 version = "0.1.0"
@@ -53,6 +53,7 @@ url = "2"
 # Workspace-local crates
 neomake-core = { path = "neomake-core", version = "0.1.0" }
 neomake-tomlx = { path = "neomake-tomlx", version = "0.1.0" }
+neomake-machine = { path = "neomake-machine", version = "0.1.0" }
 
 # Dev
 tempfile = "3"

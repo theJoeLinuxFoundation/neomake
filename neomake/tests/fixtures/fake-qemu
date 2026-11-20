@@ -1,0 +1,15 @@
+#!/bin/sh
+# A stand-in for qemu-system-x86_64 in neomake's tests. It prints what a
+# UEFI firmware prints as it starts a boot, then runs a shell whose prompt
+# is `joe# ` on its standard input and output, as joe Linux's test console
+# does. `systemctl reboot` starts it over (a new shell: what the last one
+# defined is gone), and `systemctl poweroff` ends it. Its arguments are
+# appended to fake-qemu.args in its directory.
+printf '%s\n' "$*" >> fake-qemu.args
+printf 'BdsDxe: starting Boot0001 "fake disk"\r\n'
+FAKE_QEMU=$0
+FAKE_ARGS="$*"
+export FAKE_QEMU FAKE_ARGS
+ENV=$(dirname "$0")/fake-qemu.rc
+export ENV
+exec sh -i 2>&1

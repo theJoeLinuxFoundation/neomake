@@ -27,8 +27,10 @@ SHA-256 content-addressable cache.
 neomake/             CLI binary
 neomake-core/        task model, DAG builder, cache, tokio executor
 neomake-tomlx/       TOMLX lexer, parser, evaluator
+neomake-machine/     QEMU machines for machine tests
 examples/            basic.toml, advanced.tomlx
 docs/tomlx-spec.md   formal TOMLX spec
+docs/testing.md      tests, services and machines
 ```
 
 ## Installation
@@ -187,6 +189,29 @@ services = ["repo"]
 steps = [{ run = 'dave --repo {{services.repo.url}} install hello' }]
 ```
 
+### Machines
+
+`[machines.*]` are QEMU virtual machines that tests run their steps in,
+over the serial console: commands and their checks, waiting for output,
+reboots, power cuts, file writes, screenshots and media changes, on a
+fresh copy of the machine's disks each run. A host without KVM, QEMU or
+UEFI firmware skips such tests with the reason. See
+[docs/testing.md](docs/testing.md#6-machines).
+
+```toml
+[machines.scaffold]
+disk = "build/images/scaffold.img"
+console = { prompt = "joe# ", banner = "BdsDxe: starting " }
+
+[tests.smoke]
+machine = "scaffold"
+steps = [
+  { run = 'findmnt -rno FSTYPE /', equals = "btrfs" },
+  { power_cut = {} },
+  { run = 'cat /var/lib/staged', equals = "7" },
+]
+```
+
 ### CLI reference
 
 ```
@@ -200,6 +225,8 @@ Subcommands:
   log [TASK] [--run ID]    Print a task's log from the last run
   cache clean              Remove every cache entry
   cache status             Print cache size and entry count
+  machine list             Print the machines
+  machine run NAME         Boot a machine on this terminal
 
 Options:
   -c, --config <FILE>      Path to config; auto-detects neomake.toml or neomake.tomlx
@@ -207,6 +234,7 @@ Options:
       --no-cache           Treat every task as a cache miss
   -q, --quiet              Show only the output of what fails
   -v, --verbose            Show every step as it passes
+      --no-kvm             Treat KVM as missing
 
 run and test options:
       --tag <TAG>          Only what has this tag (repeatable)
@@ -218,6 +246,7 @@ run and test options:
       --junit <FILE>       Write JUnit XML of the tests to FILE
       --json <FILE>        Also write the run's report to FILE
       --tail <N>           Lines of a failed task's output to show (default 20)
+      --machines <N>       Machine tests that may run at once
 ```
 
 Exit status: 0 when every task succeeded, was cached or was skipped; 1

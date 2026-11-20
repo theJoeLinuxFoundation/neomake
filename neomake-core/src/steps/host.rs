@@ -72,15 +72,36 @@ pub struct StepsResult {
     pub(crate) section: Option<String>,
 }
 
+impl StepsResult {
+    /// A test that ended before its first step (its machine did not
+    /// boot, say), for `message`.
+    pub fn before_steps(ending: Ending, message: impl Into<String>) -> Self {
+        Self {
+            ending,
+            message: Some(message.into()),
+            exit_code: None,
+            steps: Vec::new(),
+            resume: 0,
+            number: 0,
+            section: None,
+        }
+    }
+}
+
 /// Why one step did not pass.
-pub(crate) struct StepFailure {
+#[derive(Debug, Clone)]
+pub struct StepFailure {
+    /// How it ends the test.
     pub ending: Ending,
+    /// What went wrong.
     pub message: String,
+    /// The exit status of its command, if it had one.
     pub exit_code: Option<i32>,
 }
 
 impl StepFailure {
-    pub(crate) fn failed(message: impl Into<String>) -> Self {
+    /// A step that failed for `message`.
+    pub fn failed(message: impl Into<String>) -> Self {
         Self {
             ending: Ending::Failed,
             message: message.into(),
@@ -91,7 +112,7 @@ impl StepFailure {
 
 /// Run `steps` on the host. `file` names where they are written, for
 /// failure messages.
-pub(crate) async fn run(
+pub async fn run(
     steps: &[Step],
     file: Option<&str>,
     env: &mut HostEnv<'_>,
@@ -103,7 +124,11 @@ pub(crate) async fn run(
             continue;
         }
         let started = Instant::now();
-        let result = run_command_step(step, env, sink).await;
+        let result = if step.action.runs_a_command() {
+            run_host_step(step, env, sink).await
+        } else {
+            Err(StepFailure::failed("this step needs a machine"))
+        };
         if let Some(result) = runner.finish(step, started, result, sink) {
             return result;
         }
@@ -115,7 +140,7 @@ pub(crate) async fn run(
 /// sections, progress events and outcomes. Sections are not steps: they
 /// are not numbered and have no outcome, but name the section of the
 /// steps after them.
-pub(crate) struct Runner<'f> {
+pub struct Runner<'f> {
     total: usize,
     number: usize,
     position: usize,
@@ -126,7 +151,8 @@ pub(crate) struct Runner<'f> {
 }
 
 impl<'f> Runner<'f> {
-    pub(crate) fn new(steps: &[Step], file: Option<&'f str>) -> Self {
+    /// Bookkeeping for `steps`, written in `file`.
+    pub fn new(steps: &[Step], file: Option<&'f str>) -> Self {
         Self {
             total: steps
                 .iter()
@@ -144,7 +170,7 @@ impl<'f> Runner<'f> {
     /// Note the start of `steps[i]`. `false` when there is nothing to
     /// run: a section, or a stopped run (whose result [`Self::done`]
     /// then returns).
-    pub(crate) fn begin(
+    pub fn begin(
         &mut self,
         i: usize,
         step: &Step,
@@ -189,7 +215,7 @@ impl<'f> Runner<'f> {
     }
 
     /// Record how the step begun last ended; `Some` ends the run.
-    pub(crate) fn finish(
+    pub fn finish(
         &mut self,
         step: &Step,
         started: Instant,
@@ -238,7 +264,7 @@ impl<'f> Runner<'f> {
 
     /// The step begun last ended the run with `failure`; `duration` is
     /// how long it ran, if it ran at all.
-    pub(crate) fn end(
+    pub fn end(
         &mut self,
         failure: StepFailure,
         duration: Option<Duration>,
@@ -278,7 +304,7 @@ impl<'f> Runner<'f> {
     }
 
     /// Mark the steps after the one that ended the run as not run.
-    pub(crate) fn not_run_after(result: &mut StepsResult, steps: &[Step]) {
+    pub fn not_run_after(result: &mut StepsResult, steps: &[Step]) {
         let mut section = result.section.clone();
         let mut number = result.number;
         for step in steps.iter().skip(result.resume) {
@@ -300,7 +326,8 @@ impl<'f> Runner<'f> {
         result.resume = steps.len();
     }
 
-    pub(crate) fn done(&mut self) -> StepsResult {
+    /// The result of a run that got past every step (or was stopped).
+    pub fn done(&mut self) -> StepsResult {
         if let Some(stopped) = self.stopped.take() {
             return stopped;
         }
@@ -317,7 +344,7 @@ impl<'f> Runner<'f> {
 }
 
 /// `step` with every placeholder replaced.
-pub(crate) fn resolve(step: &Step, vars: &Vars) -> Result<Step, StepFailure> {
+pub fn resolve(step: &Step, vars: &Vars) -> Result<Step, StepFailure> {
     let mut step = step.clone();
     for s in step.strings_mut() {
         *s = vars.apply(s).map_err(StepFailure::failed)?;
@@ -327,7 +354,7 @@ pub(crate) fn resolve(step: &Step, vars: &Vars) -> Result<Step, StepFailure> {
 
 /// How long a step may run: the test's deadline, shortened by the
 /// step's own timeout.
-pub(crate) fn step_deadline(step: &Step, deadline: Option<Instant>) -> Option<Instant> {
+pub fn step_deadline(step: &Step, deadline: Option<Instant>) -> Option<Instant> {
     let own = step.timeout.map(|t| Instant::now() + t);
     match (deadline, own) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -336,14 +363,15 @@ pub(crate) fn step_deadline(step: &Step, deadline: Option<Instant>) -> Option<In
 }
 
 /// Pause before repeating a waiting step; `false` when it is cancelled.
-pub(crate) async fn pause(interval: Duration, cancel: &CancellationToken) -> bool {
+pub async fn pause(interval: Duration, cancel: &CancellationToken) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(interval) => true,
         _ = cancel.cancelled() => false,
     }
 }
 
-async fn run_command_step(
+/// Run a `run` or `host` step on the host, with its checks.
+pub async fn run_host_step(
     step: &Step,
     env: &mut HostEnv<'_>,
     sink: &Sink,
@@ -351,7 +379,7 @@ async fn run_command_step(
     let resolved = resolve(step, &env.vars)?;
     let (script, tty) = match &resolved.action {
         Action::Run { script, tty } | Action::Host { script, tty } => (script.clone(), tty.clone()),
-        Action::Section(_) => unreachable!("a section runs nothing"),
+        _ => return Err(StepFailure::failed("this step runs no command")),
     };
     let full = match &env.prelude {
         Some(p) => format!("{p}\n{script}"),

@@ -31,11 +31,15 @@ struct Value {
     fields: BTreeMap<String, String>,
 }
 
-/// The variants of `task` for `matrix`, or an error message.
+/// A variant's values, as placeholders name them (`matrix.base`).
+pub(super) type Fields = BTreeMap<String, String>;
+
+/// The variants of `task` for `matrix`, with their values, or an error
+/// message.
 pub(super) fn expand(
     task: &Task,
     matrix: &IndexMap<String, Vec<toml::Value>>,
-) -> Result<Vec<Task>, String> {
+) -> Result<Vec<(Task, Fields)>, String> {
     let mut keys: Vec<(String, Vec<Value>)> = Vec::new();
     for (key, values) in matrix {
         if !super::steps::valid_var_name(key) {
@@ -108,7 +112,7 @@ pub(super) fn expand(
                 .map(|(k, v)| (k.clone(), v.name.clone()))
                 .collect(),
         });
-        out.push(variant);
+        out.push((variant, fields));
     }
     Ok(out)
 }
@@ -177,7 +181,10 @@ pub(super) fn for_each_string(task: &mut Task, f: &mut dyn FnMut(&mut String)) {
     if let Some(p) = &mut task.prelude {
         f(p);
     }
-    for step in &mut task.steps {
+    if let Some(b) = &mut task.on_boot {
+        f(b);
+    }
+    for step in task.steps.iter_mut().chain(task.on_failure.iter_mut()) {
         for s in step.strings_mut() {
             f(s);
         }

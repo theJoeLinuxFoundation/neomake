@@ -168,6 +168,7 @@ impl Cache {
         line(&[b"."]);
         line(&[b"cwd:", task.cwd.as_deref().unwrap_or("").as_bytes()]);
         line(&[b"services:", task.services.join(",").as_bytes()]);
+        line(&[b"machine:", format!("{:?}", task.machine).as_bytes()]);
         line(&[b"env_clear:", if task.env_clear { b"1" } else { b"0" }]);
         line(&[b"env:"]);
         for (k, v) in &task.env {

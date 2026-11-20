@@ -15,6 +15,7 @@
 //! [`crate::steps`]); templates of steps (`[templates.*]`) may be defined
 //! in any document. Either may have a `matrix` ([`matrix`]).
 
+mod machines;
 mod matrix;
 mod services;
 mod steps;
@@ -43,6 +44,8 @@ pub struct Settings {
     pub keep_runs: usize,
     /// The shell of a task that sets none.
     pub shell: Option<Vec<String>>,
+    /// How many machine tests may run at once.
+    pub max_machines: usize,
 }
 
 impl Default for Settings {
@@ -52,6 +55,7 @@ impl Default for Settings {
             default_timeout: None,
             keep_runs: 20,
             shell: None,
+            max_machines: 2,
         }
     }
 }
@@ -67,6 +71,8 @@ pub struct Config {
     pub tasks: TaskSet,
     /// Every service, by name.
     pub services: BTreeMap<String, crate::services::Service>,
+    /// Every machine, by name.
+    pub machines: BTreeMap<String, crate::machine::MachineSpec>,
 }
 
 impl Config {
@@ -81,6 +87,7 @@ impl Config {
         // Templates first, from every document, since any test may use them.
         let mut parsed = Vec::with_capacity(sources.len());
         let mut templates = steps::Templates::default();
+        let mut machines = machines::Machines::default();
         for (path, text) in sources {
             let mut raw: RawConfig = toml::from_str(text).map_err(|e| {
                 let line = e.span().map(|s| line_of(text, s.start));
@@ -89,8 +96,19 @@ impl Config {
             for (name, template) in std::mem::take(&mut raw.templates) {
                 templates.add(name, template, path, text)?;
             }
+            for (name, machine) in std::mem::take(&mut raw.machines) {
+                let at = Location {
+                    file: path.clone(),
+                    line: line_of(text, machine.span().start),
+                };
+                machines
+                    .add(name, machine.into_inner(), at.clone())
+                    .map_err(|m| ConfigError::new(&at.file, Some(at.line), m))?;
+            }
             parsed.push(raw);
         }
+        let machine_specs = machines::check(&machines)
+            .map_err(|(at, m)| ConfigError::new(&at.file, Some(at.line), m))?;
 
         for (index, ((path, text), raw)) in sources.iter().zip(parsed).enumerate() {
             if let Some(raw_settings) = raw.settings {
@@ -158,17 +176,48 @@ impl Config {
                 let origin = steps::Origin { file: path, text };
                 let mut raw_task = raw_task.into_inner();
                 let matrix_values = std::mem::take(&mut raw_task.matrix);
-                let task =
-                    convert_task(name.clone(), kind, raw_task, &location, &origin, &templates)?;
+                let machine_value = raw_task.machine.take();
+                if machine_value.is_some() && kind != TaskKind::Test {
+                    return Err(ConfigError::new(
+                        path,
+                        Some(location.line),
+                        format!("task `{name}` has a `machine`, which only tests have"),
+                    ));
+                }
+                let task = convert_task(
+                    name.clone(),
+                    kind,
+                    raw_task,
+                    &location,
+                    &origin,
+                    &templates,
+                    machine_value.is_some(),
+                )?;
                 let variants = if matrix_values.is_empty() {
-                    vec![task]
+                    vec![(task, BTreeMap::new())]
                 } else {
                     matrix::expand(&task, &matrix_values).map_err(|m| {
                         ConfigError::new(path, Some(location.line), format!("`{name}`: {m}"))
                     })?
                 };
                 defined_in.insert(name, location.clone());
-                for variant in variants {
+                for (mut variant, fields) in variants {
+                    if let Some(value) = &machine_value {
+                        let mut value = value.clone();
+                        machines::map_strings(&mut value, &mut |s| {
+                            *s = crate::steps::vars::substitute_known(s, &|n| {
+                                fields.get(n).cloned()
+                            });
+                        });
+                        let spec = machines.resolve(&value, &location).map_err(|m| {
+                            ConfigError::new(
+                                path,
+                                Some(location.line),
+                                format!("`{}`: {m}", variant.name),
+                            )
+                        })?;
+                        variant.machine = Some(spec);
+                    }
                     if variant.variant.is_some() {
                         if let Some(first) = defined_in.get(&variant.name) {
                             return Err(ConfigError::new(
@@ -242,6 +291,7 @@ impl Config {
             settings,
             tasks: TaskSet::new(tasks),
             services,
+            machines: machine_specs,
         })
     }
 }
@@ -270,6 +320,16 @@ impl Config {
                     known.extend(service.var_names());
                 }
             }
+            if let Some(machine) = &task.machine {
+                known.extend(crate::machine::MACHINE_VARS.iter().map(|v| v.to_string()));
+                known.extend(
+                    machine
+                        .disks
+                        .iter()
+                        .filter_map(|d| d.name.as_ref())
+                        .map(|n| format!("machine.disks.{n}")),
+                );
+            }
             let mut report = |line: Option<usize>, what: &str, name: &str| {
                 let at = match line.or(task.source.as_ref().map(|l| l.line)) {
                     Some(l) => format!("{file}:{l}"),
@@ -296,7 +356,7 @@ impl Config {
                     report(None, "a field other than its command or steps", &name);
                 }
             }
-            for step in &task.steps {
+            for step in task.steps.iter().chain(task.on_failure.iter()) {
                 let line = step.line;
                 let mut copy = step.clone();
                 for s in copy.strings_mut() {
@@ -344,6 +404,7 @@ fn convert_settings(raw: RawSettings, path: &Path) -> Result<Settings, ConfigErr
             .map_err(|e| ConfigError::new(path, None, format!("settings.default_timeout: {e}")))?,
         keep_runs: raw.keep_runs.unwrap_or(defaults.keep_runs),
         shell: raw.shell.map(ShellValue::into_argv),
+        max_machines: raw.max_machines.unwrap_or(defaults.max_machines).max(1),
     })
 }
 
@@ -354,6 +415,7 @@ fn convert_task(
     at: &Location,
     origin: &steps::Origin<'_>,
     templates: &steps::Templates,
+    has_machine: bool,
 ) -> Result<Task, ConfigError> {
     let err = |msg: String| ConfigError::new(&at.file, Some(at.line), msg);
     if name.is_empty() {
@@ -369,7 +431,18 @@ fn convert_task(
     } else {
         "task"
     };
-    let steps = steps::convert(&raw.steps, origin, templates)?;
+    let steps = steps::convert(&raw.steps, origin, templates, has_machine)?;
+    let on_failure = steps::convert(&raw.on_failure, origin, templates, has_machine)?;
+    if !has_machine && (raw.on_boot.is_some() || !on_failure.is_empty() || raw.autoboot.is_some()) {
+        return Err(err(format!(
+            "`{name}`: `on_boot`, `on_failure` and `autoboot` are for tests with a `machine`"
+        )));
+    }
+    if has_machine && steps.is_empty() {
+        return Err(err(format!(
+            "test `{name}` has a machine but no steps to run in it"
+        )));
+    }
     let command = match (raw.command, steps.is_empty()) {
         (Some(c), true) if c.trim().is_empty() => {
             return Err(err(format!("{what} `{name}` has an empty `command`")))
@@ -438,6 +511,10 @@ fn convert_task(
         exclusive: raw.exclusive,
         interactive: raw.interactive,
         services: raw.services,
+        machine: None,
+        autoboot: raw.autoboot.unwrap_or(true),
+        on_boot: raw.on_boot,
+        on_failure,
         source: Some(at.clone()),
         name,
     })
@@ -456,6 +533,8 @@ struct RawConfig {
     templates: IndexMap<String, Spanned<steps::RawTemplate>>,
     #[serde(default)]
     services: IndexMap<String, Spanned<services::RawService>>,
+    #[serde(default)]
+    machines: IndexMap<String, Spanned<machines::RawMachine>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -469,6 +548,8 @@ struct RawSettings {
     keep_runs: Option<usize>,
     #[serde(default)]
     shell: Option<ShellValue>,
+    #[serde(default)]
+    max_machines: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,6 +599,14 @@ struct RawTask {
     interactive: bool,
     #[serde(default)]
     services: Vec<String>,
+    #[serde(default)]
+    machine: Option<toml::Value>,
+    #[serde(default)]
+    autoboot: Option<bool>,
+    #[serde(default)]
+    on_boot: Option<String>,
+    #[serde(default)]
+    on_failure: Vec<Spanned<steps::RawStep>>,
 }
 
 #[derive(Debug, Default, Deserialize)]

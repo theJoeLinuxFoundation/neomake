@@ -66,12 +66,81 @@ pub enum Action {
         /// Run it on a pseudo-terminal.
         tty: Option<Tty>,
     },
+    /// Wait for the machine's console to show a pattern.
+    Expect {
+        /// The regular expression.
+        pattern: String,
+        /// How many times it must appear, one after the other.
+        times: u32,
+        /// What its groups must be, in order (at the last appearance).
+        groups: Vec<String>,
+        /// Variables to set from its groups, in order.
+        capture: Vec<String>,
+    },
+    /// Type text on the machine's console, as it is.
+    Send(String),
+    /// Start the machine and wait for it to boot.
+    Boot,
+    /// Start the machine without waiting.
+    Start,
+    /// Wait for a boot: the firmware's banner, then the prompt.
+    WaitBoot,
+    /// Wait for the prompt.
+    WaitPrompt,
+    /// Reboot cleanly, and wait for the next boot unless `wait` is false.
+    Reboot {
+        /// Wait for the next boot.
+        wait: bool,
+    },
+    /// Pull the plug, start it again, and wait for the boot unless
+    /// `wait` is false.
+    PowerCut {
+        /// Wait for the next boot.
+        wait: bool,
+    },
+    /// Pull the plug.
+    Kill,
+    /// Power off cleanly, and wait for the machine to stop.
+    Shutdown,
+    /// Write a file in the machine.
+    Write {
+        /// Where.
+        path: String,
+        /// What.
+        content: WriteSource,
+        /// Its mode, as `chmod` takes it.
+        mode: Option<String>,
+    },
+    /// Save what the machine's display shows, as a PNG file in the
+    /// test's directory.
+    Screenshot(String),
+    /// Attach a medium, from the next start on.
+    Attach(crate::machine::Media),
+    /// Detach a medium, from the next start on.
+    Detach(String),
+}
+
+/// What a `write` step writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteSource {
+    /// This text.
+    Inline(String),
+    /// The contents of this file (relative to the project root).
+    File(String),
 }
 
 impl Action {
     /// Whether the step runs a command whose output can be checked.
     pub fn runs_a_command(&self) -> bool {
         matches!(self, Action::Run { .. } | Action::Host { .. })
+    }
+
+    /// Whether the step needs a machine.
+    pub fn needs_a_machine(&self) -> bool {
+        !matches!(
+            self,
+            Action::Section(_) | Action::Run { .. } | Action::Host { .. }
+        )
     }
 }
 
@@ -289,6 +358,25 @@ impl Step {
             Action::Section(title) => title.clone(),
             Action::Run { script, .. } => format!("run: {}", summarize(script)),
             Action::Host { script, .. } => format!("host: {}", summarize(script)),
+            Action::Expect { pattern, times, .. } if *times > 1 => {
+                format!("expect /{pattern}/ {times} times")
+            }
+            Action::Expect { pattern, .. } => format!("expect /{pattern}/"),
+            Action::Send(text) => format!("send {:?}", summarize(text)),
+            Action::Boot => "boot".into(),
+            Action::Start => "start".into(),
+            Action::WaitBoot => "wait for a boot".into(),
+            Action::WaitPrompt => "wait for the prompt".into(),
+            Action::Reboot { wait: true } => "reboot".into(),
+            Action::Reboot { wait: false } => "reboot (without waiting)".into(),
+            Action::PowerCut { wait: true } => "power cut".into(),
+            Action::PowerCut { wait: false } => "power cut (without waiting)".into(),
+            Action::Kill => "pull the plug".into(),
+            Action::Shutdown => "shut down".into(),
+            Action::Write { path, .. } => format!("write {path}"),
+            Action::Screenshot(name) => format!("screenshot {name}"),
+            Action::Attach(m) => format!("attach {} ({})", m.name, m.file),
+            Action::Detach(name) => format!("detach {name}"),
         }
     }
 
@@ -310,6 +398,38 @@ impl Step {
                     out.extend(tty.forbid.iter_mut());
                 }
             }
+            Action::Expect {
+                pattern, groups, ..
+            } => {
+                out.push(pattern);
+                out.extend(groups.iter_mut());
+            }
+            Action::Send(text) | Action::Screenshot(text) | Action::Detach(text) => out.push(text),
+            Action::Write {
+                path,
+                content,
+                mode,
+            } => {
+                out.push(path);
+                match content {
+                    WriteSource::Inline(s) | WriteSource::File(s) => out.push(s),
+                }
+                if let Some(m) = mode {
+                    out.push(m);
+                }
+            }
+            Action::Attach(m) => {
+                out.push(&mut m.name);
+                out.push(&mut m.file);
+            }
+            Action::Boot
+            | Action::Start
+            | Action::WaitBoot
+            | Action::WaitPrompt
+            | Action::Reboot { .. }
+            | Action::PowerCut { .. }
+            | Action::Kill
+            | Action::Shutdown => {}
         }
         let c = &mut self.check;
         out.extend(c.contains.iter_mut());

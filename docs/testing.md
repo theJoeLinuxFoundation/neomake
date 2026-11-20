@@ -298,7 +298,133 @@ A command service provides these when it is ready by `tcp` or `http`.
 
 ---
 
-## 6. Running tests
+## 6. Machines
+
+A machine test runs its steps in a QEMU virtual machine, over its serial
+console. The machine is described once:
+
+```toml
+[machines.scaffold]
+disk = "build/images/scaffold.img"
+memory = "2G"
+cpus = 4
+console = { prompt = "joe# ", banner = "BdsDxe: starting ", setup = "dmesg -n 1; stty cols 250 rows 50" }
+
+[machines.live]
+use = "scaffold"                      # everything not set here comes from scaffold
+disks = [{ size = "40G" }]            # an empty disk to install onto
+media = [{ file = "build/images/joe-live.iso", as = "cd" }]
+memory = "6G"
+display = true
+```
+
+and a test names it:
+
+```toml
+[tests.smoke]
+deps = ["scaffold-image"]
+machine = "scaffold"                  # or { use = "scaffold", memory = "4G" }
+timeout = "10m"
+steps = [
+  { run = 'cat /proc/cmdline', matches = 'rootflags=subvol=joe/deploy/1\b', lacks = "initrd=" },
+  { run = 'findmnt -rno FSTYPE,OPTIONS /', matches = '^btrfs \S*\brw\b' },
+  { reboot = {} },
+  { run = 'systemctl is-system-running --wait', exit = "any", timeout = "3m" },
+]
+```
+
+The machine boots before the first step (unless the test says
+`autoboot = false`): neomake waits for the console's `banner` (what the
+firmware prints as it starts a boot), then for its `prompt`, then runs
+its `setup`. The guest must log a shell in on its first serial port
+(`ttyS0`); joe Linux's `--test` images do.
+
+### What a machine is
+
+| Field | Meaning |
+|---|---|
+| `disk` | The image it boots from. Each run gets its own copy (a reflink on btrfs, a sparse copy elsewhere); the image itself is never changed. |
+| `disks = [{ file, size, name }]` | Further disks: a copy of `file` (grown to `size`), or an empty disk of `size`. `{{machine.disks.NAME}}` is a named disk's path. |
+| `media = [{ file, as = "cd" or "usb", name }]` | Removable media, first in the boot order. |
+| `memory`, `cpus` | `"2G"` and `2` by default. |
+| `kvm` | `"require"` (the default: on a host without a usable `/dev/kvm`, the test is skipped with that reason), `"prefer"` (emulate without it, slowly) or `"off"`. |
+| `firmware` | `"uefi"` (the default: OVMF, found where Arch, Debian, Ubuntu and Fedora install it), `{ code = "…", vars = "…" }`, or `"bios"`. Each run gets its own copy of the variable store. |
+| `display` | A virtio GPU, keyboard and tablet, and screenshots. |
+| `shares = [{ dir, tag, optional }]` | Host directories shared over virtiofs (mounted in the guest with `mount -t virtiofs TAG …`); `virtiofsd` runs as the user. |
+| `net` | User-mode networking, on by default: the host is `10.0.2.2` to the guest. |
+| `console` | `prompt` (required), `banner`, `setup`, and the `reboot` and `poweroff` commands (`systemctl reboot` and `systemctl poweroff` by default). |
+| `boot_timeout`, `command_timeout` | How long a boot (3 minutes) and a command (2 minutes) may take, unless a step says otherwise. |
+| `qemu`, `extra_args`, `env` | The QEMU program, further arguments, and its environment. |
+| `use` | Another machine this one builds on. |
+
+A test whose machine cannot run on the host, because QEMU, KVM, the
+firmware or virtiofsd is missing, is skipped with the reason.
+`neomake --no-kvm` treats KVM as missing. At most `max_machines`
+machine tests run at once (2, set in `[settings]` or with `--machines`).
+
+### Steps in a machine
+
+`run` runs in the machine's shell; `host` runs on the host, as in any
+test, so a test can change what the machine will download while the
+machine runs. The rest drive the machine:
+
+| Step | Does |
+|---|---|
+| `{ expect = 'pattern', times = 3, groups = ["joe/deploy/4", "fail"], capture = ["subvol", "result"] }` | Waits for the console to show the pattern (`times` times over), checks its groups and captures them. |
+| `{ send = "text\n" }` | Types text on the console as it is. |
+| `{ reboot = {} }`, `{ reboot = { wait = false } }` | Reboots cleanly, and waits for the next boot unless told not to (to `expect` what the shutdown and boot print). |
+| `{ power_cut = {} }` | Pulls the plug and starts the machine again (and waits, unless `wait = false`). |
+| `{ wait_boot = true }`, `{ wait_prompt = true }` | Waits for a boot, or for the prompt. |
+| `{ kill = true }`, `{ start = true }`, `{ boot = true }`, `{ shutdown = true }` | Pulls the plug; starts without waiting; starts and waits for the boot; powers off cleanly. |
+| `{ write = "/usr/local/bin/x", content = "…", mode = "755" }` | Writes a file in the machine; `from = "tests/vm/files/x"` takes it from a host file instead. |
+| `{ screenshot = "gdm.png" }` | Saves what the display shows, in the test's directory. |
+| `{ attach = { file, as, name } }`, `{ detach = "medium" }` | Changes the media, from the next start on. |
+
+A command runs in the console's shell, which keeps what it defines until
+the next boot. A command that spans lines, is long, or holds a `#` is
+written to a file in the machine's `/tmp` and sourced, so a multi-line
+`run` can define shell functions for later steps. A command must not
+`exit` the shell, which would log the console out. Output on a serial
+console is one stream, so a guest command's checks see stdout and stderr
+together.
+
+`on_boot` is shell text run after every boot (a good place for
+functions the steps share), and `on_failure` lists steps run when a step
+has failed, to record what shows why. Their output goes to the test's
+log, and their own failures are only noted there:
+
+```toml
+on_boot = '''
+expect_subvol() { grep -q "rootflags=subvol=joe/deploy/$1\b" /proc/cmdline; }
+'''
+on_failure = [{ run = 'journalctl -b --no-pager | tail -n 50' }]
+```
+
+Placeholders of machine tests: `{{machine.name}}`, `{{machine.dir}}`
+(where its disks and logs are), `{{machine.disk}}` (the copy of its first
+disk) and `{{machine.console}}` (its console log).
+
+### What a machine test leaves
+
+In the test's directory: `console.log` (everything the machine printed),
+`console.timed.log` (each line with the seconds since QEMU started),
+`qemu.log` (QEMU's command line and messages), screenshots, and, if the
+test failed, the copies of its disks, so that what the machine left can
+be looked at. A failure caused by the machine quotes the console's last
+output.
+
+### On the terminal
+
+```
+neomake machine list
+neomake machine run scaffold                    a fresh copy of its disks, console on this terminal (Ctrl-A X quits)
+neomake machine run desktop --persist build/vm  a machine that keeps its disks from one run to the next
+neomake machine run live --media build/images/joe-live.iso
+```
+
+---
+
+## 7. Running tests
 
 ```
 neomake test                     every test, and what they depend on
@@ -335,7 +461,7 @@ neomake log cli-install          a test's log from the last run (--run ID for an
 
 ---
 
-## 7. What a run leaves
+## 8. What a run leaves
 
 Every run has a directory, `<state_dir>/runs/<id>/` (`runs/latest` names
 the newest), which keeps:

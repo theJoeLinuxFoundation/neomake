@@ -9,6 +9,7 @@
 //! neomake [GLOBAL] check
 //! neomake [GLOBAL] log   [TASK] [--run ID]
 //! neomake [GLOBAL] cache clean | status
+//! neomake [GLOBAL] machine run NAME [--persist DIR] [--media FILE]
 //! ```
 
 use std::path::PathBuf;
@@ -43,6 +44,11 @@ pub struct Cli {
     /// Show more: every step as it passes; with `list`, requirements.
     #[arg(short, long, global = true, default_value_t = false)]
     pub verbose: bool,
+
+    /// Do not use KVM: machines that require it are skipped, the rest are
+    /// emulated (slowly).
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_kvm: bool,
 
     /// Subcommand.
     #[command(subcommand)]
@@ -93,6 +99,29 @@ pub enum Command {
     /// Cache management subcommands.
     #[command(subcommand)]
     Cache(CacheCommand),
+    /// Machines.
+    #[command(subcommand)]
+    Machine(MachineCommand),
+}
+
+/// `machine` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum MachineCommand {
+    /// Boot a machine with its serial console on this terminal (Ctrl-A X
+    /// quits), on a fresh copy of its disks, or on the ones in `--persist`.
+    Run {
+        /// The machine.
+        name: String,
+        /// Keep the machine's disks in this directory, and boot from them
+        /// next time.
+        #[arg(long, value_name = "DIR")]
+        persist: Option<PathBuf>,
+        /// Attach an image as a CD as well (may be given more than once).
+        #[arg(long, value_name = "FILE")]
+        media: Vec<PathBuf>,
+    },
+    /// List the machines.
+    List,
 }
 
 /// How progress is shown.
@@ -148,6 +177,10 @@ pub struct RunArgs {
     /// How progress is shown.
     #[arg(long, value_enum)]
     pub output: Option<OutputMode>,
+
+    /// How many machine tests may run at once (else `settings.max_machines`).
+    #[arg(long, value_name = "N")]
+    pub machines: Option<usize>,
 }
 
 /// `cache` subcommands.

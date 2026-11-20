@@ -60,6 +60,73 @@ pub(super) struct RawStep {
     interval: Option<RawDuration>,
     #[serde(default)]
     tty: Option<TtyValue>,
+    // What only machine tests do.
+    #[serde(default)]
+    expect: Option<String>,
+    #[serde(default)]
+    times: Option<u32>,
+    #[serde(default)]
+    groups: Option<Vec<String>>,
+    #[serde(default)]
+    send: Option<String>,
+    #[serde(default)]
+    boot: Option<Flag>,
+    #[serde(default)]
+    start: Option<Flag>,
+    #[serde(default)]
+    wait_boot: Option<Flag>,
+    #[serde(default)]
+    wait_prompt: Option<Flag>,
+    #[serde(default)]
+    reboot: Option<Flag>,
+    #[serde(default)]
+    power_cut: Option<Flag>,
+    #[serde(default)]
+    kill: Option<Flag>,
+    #[serde(default)]
+    shutdown: Option<Flag>,
+    #[serde(default)]
+    write: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    screenshot: Option<String>,
+    #[serde(default)]
+    attach: Option<super::machines::RawMedia>,
+    #[serde(default)]
+    detach: Option<String>,
+}
+
+/// `reboot = true`, or `reboot = { wait = false }`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum Flag {
+    On(bool),
+    With(FlagOptions),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlagOptions {
+    #[serde(default)]
+    wait: Option<bool>,
+}
+
+impl Flag {
+    fn on(&self) -> bool {
+        !matches!(self, Flag::On(false))
+    }
+
+    fn wait(&self) -> bool {
+        match self {
+            Flag::With(o) => o.wait.unwrap_or(true),
+            Flag::On(_) => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +157,7 @@ impl OneOrMany {
 #[serde(untagged)]
 enum CaptureValue {
     Whole(String),
+    Groups(Vec<String>),
     Patterns(IndexMap<String, String>),
 }
 
@@ -188,11 +256,29 @@ pub(super) fn convert(
     raw: &[Spanned<RawStep>],
     origin: &Origin<'_>,
     templates: &Templates,
+    machine: bool,
 ) -> Result<Vec<Step>, ConfigError> {
     let mut out = Vec::new();
     for step in raw {
         let line = line_of(origin.text, step.span().start);
         expand(step.get_ref(), line, origin, templates, 0, &mut out)?;
+    }
+    for step in &out {
+        let at = |msg: String| ConfigError::new(origin.file, step.line, msg);
+        if step.action.needs_a_machine() && !machine {
+            return Err(at(format!(
+                "`{}` drives a machine, and this test has none (`machine = \"…\"`)",
+                step.describe()
+            )));
+        }
+        if machine {
+            if let Action::Run { tty: Some(_), .. } = &step.action {
+                return Err(at(
+                    "in a machine test, `run` runs in the machine, where there is no terminal to give it; `host` with `tty` runs on the host"
+                        .into(),
+                ));
+            }
+        }
     }
     Ok(out)
 }
@@ -280,10 +366,15 @@ fn expand(
 }
 
 fn other_keys_than_use(raw: &RawStep) -> Option<&'static str> {
+    if let Some((key, _)) = action_keys(raw).into_iter().find(|(k, _)| *k != "use") {
+        return Some(key);
+    }
     let set: &[(&str, bool)] = &[
-        ("section", raw.section.is_some()),
-        ("run", raw.run.is_some()),
-        ("host", raw.host.is_some()),
+        ("times", raw.times.is_some()),
+        ("groups", raw.groups.is_some()),
+        ("content", raw.content.is_some()),
+        ("from", raw.from.is_some()),
+        ("mode", raw.mode.is_some()),
         ("name", raw.name.is_some()),
         ("exit", raw.exit.is_some()),
         ("stream", raw.stream.is_some()),
@@ -312,24 +403,52 @@ pub(super) fn scalar_text(value: &toml::Value) -> Result<String, String> {
     }
 }
 
-fn convert_one(raw: &RawStep, line: usize) -> Result<Step, String> {
-    let actions: Vec<&str> = [
-        ("section", raw.section.is_some()),
-        ("run", raw.run.is_some()),
-        ("host", raw.host.is_some()),
+/// The action keys `raw` has, and whether each is switched on.
+fn action_keys(raw: &RawStep) -> Vec<(&'static str, bool)> {
+    let flag = |f: &Option<Flag>| f.as_ref().map(Flag::on);
+    [
+        ("section", raw.section.as_ref().map(|_| true)),
+        ("run", raw.run.as_ref().map(|_| true)),
+        ("host", raw.host.as_ref().map(|_| true)),
+        ("use", raw.use_template.as_ref().map(|_| true)),
+        ("expect", raw.expect.as_ref().map(|_| true)),
+        ("send", raw.send.as_ref().map(|_| true)),
+        ("boot", flag(&raw.boot)),
+        ("start", flag(&raw.start)),
+        ("wait_boot", flag(&raw.wait_boot)),
+        ("wait_prompt", flag(&raw.wait_prompt)),
+        ("reboot", flag(&raw.reboot)),
+        ("power_cut", flag(&raw.power_cut)),
+        ("kill", flag(&raw.kill)),
+        ("shutdown", flag(&raw.shutdown)),
+        ("write", raw.write.as_ref().map(|_| true)),
+        ("screenshot", raw.screenshot.as_ref().map(|_| true)),
+        ("attach", raw.attach.as_ref().map(|_| true)),
+        ("detach", raw.detach.as_ref().map(|_| true)),
     ]
-    .iter()
-    .filter(|(_, present)| *present)
-    .map(|(k, _)| *k)
-    .collect();
+    .into_iter()
+    .filter_map(|(k, on)| on.map(|on| (k, on)))
+    .collect()
+}
+
+fn convert_one(raw: &RawStep, line: usize) -> Result<Step, String> {
+    let actions: Vec<(&str, bool)> = action_keys(raw);
     let action_name = match actions.as_slice() {
-        [one] => *one,
-        [] => return Err("a step needs one of `run`, `host`, `section` or `use`".into()),
+        [(one, true)] => *one,
+        [(one, false)] => {
+            return Err(format!("`{one} = false` does nothing; leave the step out"))
+        }
+        [] => {
+            return Err(
+                "a step needs one of `run`, `host`, `section` or `use`, or in a machine test `expect`, `send`, `boot`, `reboot`, `power_cut`, `write`, `screenshot` and the like"
+                    .into(),
+            )
+        }
         many => {
             return Err(format!(
                 "a step does one thing, but this one has {}",
                 many.iter()
-                    .map(|k| format!("`{k}`"))
+                    .map(|(k, _)| format!("`{k}`"))
                     .collect::<Vec<_>>()
                     .join(" and ")
             ))
@@ -337,6 +456,19 @@ fn convert_one(raw: &RawStep, line: usize) -> Result<Step, String> {
     };
     if !raw.with.is_empty() {
         return Err("`with` goes with `use`".into());
+    }
+    if action_name != "expect" && (raw.times.is_some() || raw.groups.is_some()) {
+        return Err("`times` and `groups` go with `expect`".into());
+    }
+    if action_name != "write" && (raw.content.is_some() || raw.from.is_some() || raw.mode.is_some())
+    {
+        return Err("`content`, `from` and `mode` go with `write`".into());
+    }
+    if matches!(raw.capture, Some(CaptureValue::Groups(_))) && action_name != "expect" {
+        return Err("`capture = [names]` names an `expect` pattern's groups; elsewhere it is `capture = { name = 'pattern' }`".into());
+    }
+    if action_name != "run" && action_name != "host" && action_name != "section" {
+        return convert_machine_step(raw, line, action_name);
     }
 
     let tty = match &raw.tty {
@@ -426,6 +558,7 @@ fn convert_one(raw: &RawStep, line: usize) -> Result<Step, String> {
                     pattern: Some(pattern.clone()),
                 })
                 .collect(),
+            Some(CaptureValue::Groups(_)) => unreachable!("rejected above"),
         },
     };
 
@@ -491,6 +624,134 @@ fn convert_one(raw: &RawStep, line: usize) -> Result<Step, String> {
             within,
             interval: interval.unwrap_or(Duration::from_secs(1)),
         }),
+    })
+}
+
+fn convert_machine_step(raw: &RawStep, line: usize, action_name: &str) -> Result<Step, String> {
+    // Checks of a command's output have no command to look at here.
+    let check_keys = [
+        ("exit", raw.exit.is_some()),
+        ("stream", raw.stream.is_some()),
+        ("contains", raw.contains.is_some()),
+        ("lacks", raw.lacks.is_some()),
+        ("matches", raw.matches.is_some()),
+        ("equals", raw.equals.is_some()),
+        ("tty", raw.tty.is_some()),
+        ("wait", raw.wait.is_some()),
+        ("interval", raw.interval.is_some()),
+    ];
+    if let Some((key, _)) = check_keys.iter().find(|(_, present)| *present) {
+        return Err(format!(
+            "`{key}` checks a command's output, and an `{action_name}` step runs none"
+        ));
+    }
+    let timeout_allowed = matches!(
+        action_name,
+        "expect"
+            | "boot"
+            | "wait_boot"
+            | "wait_prompt"
+            | "reboot"
+            | "power_cut"
+            | "shutdown"
+            | "write"
+    );
+    if raw.timeout.is_some() && !timeout_allowed {
+        return Err(format!(
+            "an `{action_name}` step does not wait, so it has no `timeout`"
+        ));
+    }
+    if raw.capture.is_some() && action_name != "expect" {
+        return Err(format!("an `{action_name}` step has nothing to capture"));
+    }
+    let wait = |f: &Option<Flag>| f.as_ref().map(Flag::wait).unwrap_or(true);
+    let action = match action_name {
+        "expect" => {
+            let pattern = raw.expect.clone().unwrap_or_default();
+            if vars::names(&pattern).is_empty() {
+                crate::steps::compile(&pattern)?;
+            }
+            let times = raw.times.unwrap_or(1);
+            if times == 0 {
+                return Err("`times = 0` expects nothing; leave the step out".into());
+            }
+            let capture = match &raw.capture {
+                None => Vec::new(),
+                Some(CaptureValue::Groups(names)) => names.clone(),
+                Some(CaptureValue::Whole(name)) => vec![name.clone()],
+                Some(CaptureValue::Patterns(_)) => return Err(
+                    "an `expect` step captures its own pattern's groups: `capture = [\"name\", …]`"
+                        .into(),
+                ),
+            };
+            for name in &capture {
+                if !valid_var_name(name) {
+                    return Err(format!("`{name}` cannot be captured into"));
+                }
+            }
+            Action::Expect {
+                pattern,
+                times,
+                groups: raw.groups.clone().unwrap_or_default(),
+                capture,
+            }
+        }
+        "send" => Action::Send(raw.send.clone().unwrap_or_default()),
+        "boot" => Action::Boot,
+        "start" => Action::Start,
+        "wait_boot" => Action::WaitBoot,
+        "wait_prompt" => Action::WaitPrompt,
+        "reboot" => Action::Reboot {
+            wait: wait(&raw.reboot),
+        },
+        "power_cut" => Action::PowerCut {
+            wait: wait(&raw.power_cut),
+        },
+        "kill" => Action::Kill,
+        "shutdown" => Action::Shutdown,
+        "write" => {
+            let content = match (&raw.content, &raw.from) {
+                (Some(c), None) => crate::steps::WriteSource::Inline(c.clone()),
+                (None, Some(f)) => crate::steps::WriteSource::File(f.clone()),
+                _ => {
+                    return Err(
+                        "a `write` step has `content` or `from` (a file on the host)".into(),
+                    )
+                }
+            };
+            Action::Write {
+                path: raw.write.clone().unwrap_or_default(),
+                content,
+                mode: raw.mode.clone(),
+            }
+        }
+        "screenshot" => {
+            let name = raw.screenshot.clone().unwrap_or_default();
+            if name.is_empty() || name.contains('/') {
+                return Err("a screenshot is named by a file name, without a directory".into());
+            }
+            Action::Screenshot(name)
+        }
+        "attach" => Action::Attach(super::machines::media(
+            raw.attach.clone().expect("present"),
+            0,
+        )?),
+        "detach" => Action::Detach(raw.detach.clone().unwrap_or_default()),
+        other => unreachable!("unknown action {other}"),
+    };
+    let timeout = raw
+        .timeout
+        .clone()
+        .map(|d| d.parse())
+        .transpose()
+        .map_err(|e| format!("timeout: {e}"))?;
+    Ok(Step {
+        line: Some(line),
+        label: raw.name.clone(),
+        action,
+        check: Check::default(),
+        timeout,
+        wait: None,
     })
 }
 

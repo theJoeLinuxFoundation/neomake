@@ -33,6 +33,7 @@ pub mod error;
 pub mod executor;
 pub mod glob;
 pub mod junit;
+pub mod machine;
 pub mod process;
 pub mod report;
 pub mod rundir;

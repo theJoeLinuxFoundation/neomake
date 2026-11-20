@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cache::Cache;
 use crate::dag::Dag;
 use crate::error::ExecError;
+use crate::machine::{MachineEnv, MachineRunner};
 use crate::process::{self, Invocation, Stream};
 use crate::rundir;
 use crate::services::{Service, ServiceEvent, Services};
@@ -351,6 +352,10 @@ pub struct RunOptions {
     pub artifact_dir: Option<PathBuf>,
     /// The services tasks may use, by name.
     pub services: BTreeMap<String, Service>,
+    /// What runs machine tests (none: they fail).
+    pub machines: Option<Arc<dyn MachineRunner>>,
+    /// How many machine tests may run at once.
+    pub max_machines: usize,
 }
 
 impl RunOptions {
@@ -369,6 +374,8 @@ impl RunOptions {
             tail_lines: 40,
             artifact_dir: None,
             services: BTreeMap::new(),
+            machines: None,
+            max_machines: 2,
         }
     }
 }
@@ -523,6 +530,7 @@ struct Context {
     sem: Arc<Semaphore>,
     locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     services: Services,
+    machine_slots: Arc<Semaphore>,
 }
 
 /// Run `tasks` in parallel honoring their dependency order.
@@ -576,6 +584,7 @@ pub async fn run(
         sem: Arc::new(Semaphore::new(options.concurrency.max(1))),
         locks,
         services,
+        machine_slots: Arc::new(Semaphore::new(options.max_machines.max(1))),
     });
     if let Some(dir) = &ctx.opts.log_dir {
         std::fs::create_dir_all(dir).map_err(|source| ExecError::Io {
@@ -679,6 +688,22 @@ async fn run_single(
     if let Some(reason) = task.requires.unmet(&ctx.opts.project_root) {
         return skip(SkipReason::Unmet(reason));
     }
+    if let Some(machine) = &task.machine {
+        match &ctx.opts.machines {
+            None => {
+                return fail_early(
+                    &task,
+                    ctx,
+                    "machine tests cannot run here: no machine support".into(),
+                )
+            }
+            Some(runner) => {
+                if let Some(reason) = runner.unmet(machine) {
+                    return skip(SkipReason::Unmet(reason));
+                }
+            }
+        }
+    }
 
     let checking = Instant::now();
     let cache_key = {
@@ -746,6 +771,17 @@ async fn run_single(
     } else {
         1
     };
+    let _machine_permit = if task.machine.is_some() {
+        tokio::select! {
+            permit = Arc::clone(&ctx.machine_slots).acquire_owned() => match permit {
+                Ok(p) => Some(p),
+                Err(_) => return fail_early(&task, ctx, "the scheduler shut down".into()),
+            },
+            _ = ctx.opts.cancel.cancelled() => return skip(SkipReason::Stopped),
+        }
+    } else {
+        None
+    };
     let _permit = tokio::select! {
         permit = Arc::clone(&ctx.sem).acquire_many_owned(slots) => match permit {
             Ok(p) => p,
@@ -787,7 +823,7 @@ fn fail_early(task: &Task, ctx: &Context, message: String) -> TaskOutcome {
 
 /// Where a task's output goes: its log, the tail kept for its outcome,
 /// and the reporter.
-pub(crate) struct Sink {
+pub struct Sink {
     task: String,
     log: Option<Mutex<std::io::BufWriter<std::fs::File>>>,
     tail: Mutex<VecDeque<String>>,
@@ -809,12 +845,12 @@ impl Sink {
     }
 
     /// The task's name.
-    pub(crate) fn task(&self) -> &str {
+    pub fn task(&self) -> &str {
         &self.task
     }
 
     /// A line for the log only.
-    pub(crate) fn note(&self, line: String) {
+    pub fn note(&self, line: String) {
         if let Some(log) = &self.log {
             let mut w = log.lock().unwrap_or_else(|e| e.into_inner());
             let _ = writeln!(w, "{line}");
@@ -822,7 +858,7 @@ impl Sink {
     }
 
     /// A line the task printed.
-    pub(crate) fn line(&self, stream: Stream, line: String) {
+    pub fn line(&self, stream: Stream, line: String) {
         self.note(line.clone());
         if self.tail_lines > 0 {
             let mut t = self.tail.lock().unwrap_or_else(|e| e.into_inner());
@@ -839,7 +875,7 @@ impl Sink {
     }
 
     /// An event for the reporter.
-    pub(crate) fn event(&self, event: ExecutionEvent) {
+    pub fn event(&self, event: ExecutionEvent) {
         (self.reporter)(event);
     }
 
@@ -1062,7 +1098,20 @@ async fn steps_attempt(
             .display()
             .to_string()
     });
-    let mut result = host::run(&task.steps, file.as_deref(), &mut host_env, sink).await;
+    let mut result = if task.machine.is_some() {
+        let (Some(runner), Some(dir)) = (&ctx.opts.machines, test_dir) else {
+            return failed("a machine test needs machine support and a run directory".into());
+        };
+        let env = MachineEnv {
+            host: host_env,
+            dir: absolute(dir),
+            root: absolute(&ctx.opts.project_root),
+            file: file.clone(),
+        };
+        runner.run(task, env, sink).await
+    } else {
+        host::run(&task.steps, file.as_deref(), &mut host_env, sink).await
+    };
     if result.ending != Ending::Passed {
         Runner::not_run_after(&mut result, &task.steps);
     }

@@ -1,0 +1,11 @@
+# Read by the shell fake-qemu starts: what a test console needs.
+PS1='joe# '
+stty() { :; }
+dmesg() { :; }
+systemctl() {
+    case "$1" in
+    reboot) echo "Rebooting."; exec "$FAKE_QEMU" $FAKE_ARGS ;;
+    poweroff) echo "Powering off."; exit 0 ;;
+    *) echo "systemctl $*: not in this fake" ;;
+    esac
+}

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 neomake-core = { workspace = true }
 neomake-tomlx = { workspace = true }
+neomake-machine = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }

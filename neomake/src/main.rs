@@ -32,7 +32,7 @@ use neomake_core::report::{Report, RunMeta};
 use neomake_core::select::{select, Selection};
 use neomake_core::{executor, junit, Cache, Config, Dag, Planned, RunDir, RunOptions};
 
-use crate::cli::{CacheCommand, Cli, Command, OutputMode, RunArgs};
+use crate::cli::{CacheCommand, Cli, Command, MachineCommand, OutputMode, RunArgs};
 
 fn main() -> ExitCode {
     match real_main() {
@@ -103,6 +103,7 @@ fn real_main() -> Result<ExitCode> {
         Command::List { tests } => list(&cli, *tests),
         Command::Check => check(&cli),
         Command::Log { task, run } => log(&cli, task.as_deref(), run.as_deref()),
+        Command::Machine(cmd) => machine(&cli, cmd),
         Command::Cache(cmd) => {
             let cache = match Project::load(cli.config.as_deref()) {
                 Ok(project) => project.cache()?,
@@ -140,7 +141,71 @@ fn options_for(cli: &Cli, project: &Project, args: &RunArgs) -> RunOptions {
     options.default_timeout = settings.default_timeout;
     options.default_shell = settings.shell.clone();
     options.services = project.config.services.clone();
+    options.machines = Some(Arc::new(neomake_machine::QemuRunner::new(
+        project.root(),
+        cli.no_kvm,
+    )));
+    options.max_machines = args.machines.unwrap_or(settings.max_machines).max(1);
     options
+}
+
+fn machine(cli: &Cli, cmd: &MachineCommand) -> Result<ExitCode> {
+    let project = Project::load(cli.config.as_deref())?;
+    match cmd {
+        MachineCommand::List => {
+            for m in project.config.machines.values() {
+                let disks: Vec<String> = m
+                    .disks
+                    .iter()
+                    .map(|d| d.file.clone().or(d.size.clone()).unwrap_or_default())
+                    .collect();
+                let state = neomake_machine::host::unmet(m, project.root(), cli.no_kvm)
+                    .map(|r| format!("  (cannot run here: {r})"))
+                    .unwrap_or_default();
+                println!(
+                    "  {}  {}, {} CPU{}  {}{state}",
+                    m.name,
+                    m.memory,
+                    m.cpus,
+                    if m.cpus == 1 { "" } else { "s" },
+                    disks.join(", ")
+                );
+            }
+            Ok(ExitCode::from(0))
+        }
+        MachineCommand::Run {
+            name,
+            persist,
+            media,
+        } => {
+            let spec = project.config.machines.get(name).cloned().ok_or_else(|| {
+                let names: Vec<&str> = project.config.machines.keys().map(String::as_str).collect();
+                match executor::closest(name, names.into_iter()) {
+                    Some(s) => anyhow!("no machine named `{name}` (did you mean `{s}`?)"),
+                    None => anyhow!("no machine named `{name}`"),
+                }
+            })?;
+            if let Some(reason) = neomake_machine::host::unmet(&spec, project.root(), cli.no_kvm) {
+                bail!("machine `{name}` cannot run here: {reason}");
+            }
+            let options = neomake_machine::interactive::Options {
+                persist: persist.clone(),
+                scratch: project.state_dir().join("machines").join(name),
+                media: media.clone(),
+                no_kvm: cli.no_kvm,
+            };
+            let status = tokio_runtime()?
+                .block_on(neomake_machine::interactive::run(
+                    &spec,
+                    project.root(),
+                    &options,
+                ))
+                .map_err(|e| anyhow!(e))?;
+            Ok(ExitCode::from(
+                status.code().unwrap_or(1).clamp(0, 255) as u8
+            ))
+        }
+    }
 }
 
 fn run(cli: &Cli, patterns: &[String], args: &RunArgs, tests_only: bool) -> Result<ExitCode> {
