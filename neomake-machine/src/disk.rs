@@ -143,7 +143,9 @@ mod tests {
         assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dst).unwrap());
         sparse_copy(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dst).unwrap());
-        #[cfg(unix)]
+        // How holes show in block counts is the filesystem's business;
+        // Linux's (btrfs, ext4, tmpfs) all count them as unallocated.
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::MetadataExt;
             let blocks = std::fs::metadata(&dst).unwrap().blocks();
