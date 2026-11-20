@@ -1,0 +1,69 @@
+# Tests with neomake: steps, captures, a template, a matrix, a service.
+#
+#   neomake -c examples/testing.tomlx test
+#   neomake -c examples/testing.tomlx test --dry-run
+#   neomake -c examples/testing.tomlx -v test greeting
+#
+# docs/testing.md describes everything used here.
+
+$greeting = env("GREETING", "hello")
+
+[settings]
+state_dir = ".neomake"
+default_timeout = "1m"
+
+# A task the tests depend on: it makes the "program" they check.
+[tasks.program]
+command = '''
+mkdir -p build
+printf '#!/bin/sh\necho "%s, ${1:-world}"\n' "${GREETING:-hello}" > build/greet
+chmod +x build/greet
+'''
+env = { GREETING = "${greeting}" }
+outputs = ["build/greet"]
+
+# Steps shared by tests, with a parameter.
+[templates.greets]
+params = ["who"]
+steps = [{ run = 'build/greet {{who}}', equals = "${greeting}, {{who}}" }]
+
+[tests.greeting]
+description = "the program greets whoever it is told to"
+tags = ["fast"]
+deps = ["program"]
+steps = [
+  { section = "defaults" },
+  { run = 'build/greet', equals = "${greeting}, world" },
+  { section = "names" },
+  { use = "greets", with = { who = "joe" } },
+  { run = 'build/greet "$(whoami)"', capture = { me = ', (.+)$' } },
+  { run = 'test "{{me}}" = "$(whoami)"' },
+  { section = "mistakes" },
+  { run = 'build/greet a b c; exit 3', exit = 3, contains = ", a" },
+]
+
+# One definition, a variant per value: greeting-each[who=alice] and [who=bob].
+[tests.greeting-each]
+tags = ["fast"]
+deps = ["program"]
+matrix = { who = ["alice", "bob"] }
+steps = [{ use = "greets", with = { who = "{{matrix.who}}" } }]
+
+# Served while the tests that use it run. Paths are relative to the project
+# root, the directory this file is in.
+[services.files]
+serve = { dir = "." }
+
+[tests.download]
+description = "the file server serves this directory"
+services = ["files"]
+requires = { commands = ["curl"] }
+steps = [
+  { run = 'curl -sSf {{services.files.url}}/testing.tomlx', contains = "[tests.download]" },
+  { run = 'curl -s -o /dev/null -w "%{http_code}" {{services.files.url}}/nowhere', equals = "404" },
+]
+
+# Skipped, with the reason, where its requirement is not met.
+[tests.needs-a-tool]
+requires = { commands = ["a-tool-nobody-has"] }
+command = "a-tool-nobody-has --check"
