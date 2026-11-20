@@ -361,7 +361,7 @@ its `setup`. The guest must log a shell in on its first serial port
 | `kvm` | `"require"` (the default: on a host without a usable `/dev/kvm`, the test is skipped with that reason), `"prefer"` (emulate without it, slowly) or `"off"`. |
 | `firmware` | `"uefi"` (the default: OVMF, found where Arch, Debian, Ubuntu and Fedora install it), `{ code = "…", vars = "…" }`, or `"bios"`. Each run gets its own copy of the variable store. |
 | `display` | A virtio GPU, keyboard and tablet, and screenshots. |
-| `shares = [{ dir, tag, optional }]` | Host directories shared over virtiofs (mounted in the guest with `mount -t virtiofs TAG …`); `virtiofsd` runs as the user. |
+| `shares = [{ dir, tag, optional }]` | Host directories shared over virtiofs (mounted in the guest with `mount -t virtiofs TAG …`); `virtiofsd` runs as the user. Without `virtiofsd`, a test whose machine shares a directory is skipped, unless the share is `optional`: then the machine starts without it, and the test's log says so. |
 | `net` | User-mode networking, on by default: the host is `10.0.2.2` to the guest. |
 | `console` | `prompt` (required), `banner`, `setup`, and the `reboot` and `poweroff` commands (`systemctl reboot` and `systemctl poweroff` by default). |
 | `boot_timeout`, `command_timeout` | How long a boot (3 minutes) and a command (2 minutes) may take, unless a step says otherwise. |
@@ -403,14 +403,18 @@ together.
 
 `on_boot` is shell text run after every boot (a good place for
 functions the steps share), and `on_failure` lists steps run when a step
-has failed, to record what shows why. Their output goes to the test's
-log, and their own failures are only noted there:
+has failed, to record what shows why: `run`, `host` and `screenshot`
+steps. Their output goes to the test's log, and their own failures are
+only noted there:
 
 ```toml
 on_boot = '''
 expect_subvol() { grep -q "rootflags=subvol=joe/deploy/$1\b" /proc/cmdline; }
 '''
-on_failure = [{ run = 'journalctl -b --no-pager | tail -n 50' }]
+on_failure = [
+  { run = 'journalctl -b --no-pager | tail -n 50' },
+  { screenshot = "failed.png" },
+]
 ```
 
 Placeholders of machine tests: `{{machine.name}}`, `{{machine.dir}}`

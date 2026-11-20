@@ -447,6 +447,23 @@ fn convert_task(
             "`{name}`: `on_boot`, `on_failure` and `autoboot` are for tests with a `machine`"
         )));
     }
+    if let Some(step) = on_failure.iter().find(|s| {
+        !matches!(
+            s.action,
+            crate::steps::Action::Run { .. }
+                | crate::steps::Action::Host { .. }
+                | crate::steps::Action::Screenshot(_)
+        )
+    }) {
+        return Err(ConfigError::new(
+            origin.file,
+            step.line,
+            format!(
+                "`{name}`: on_failure gathers what shows why a test failed, with `run`, `host` and `screenshot` steps, not `{}`",
+                step.describe()
+            ),
+        ));
+    }
     if has_machine && steps.is_empty() {
         return Err(err(format!(
             "test `{name}` has a machine but no steps to run in it"
@@ -883,6 +900,18 @@ steps = [{ run = 'dave install {{pkg}}', contains = "{{n}} to install." }]
         )])
         .unwrap_err();
         assert!(err.message.contains("one or the other"), "{}", err.message);
+    }
+
+    #[test]
+    fn on_failure_only_gathers_evidence() {
+        let text = "[machines.m]\ndisk = 'd.img'\nconsole = { prompt = '# ' }\n[tests.t]\nmachine = 'm'\nsteps = [{ run = 'a' }]\non_failure = [{ run = 'dmesg' }, { screenshot = 'x.png' }, { reboot = {} }]\n";
+        let err = load(&[("n.toml", text)]).unwrap_err();
+        assert!(
+            err.message.contains("on_failure gathers") && err.message.contains("`reboot`"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.line, Some(7));
     }
 
     #[test]

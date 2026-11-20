@@ -39,6 +39,14 @@ pub async fn run_test(
     if !kvm && spec.kvm == Kvm::Prefer {
         sink.note("--- no KVM here: the machine is emulated, which is slow".into());
     }
+    if host::virtiofsd().is_none() {
+        for share in spec.shares.iter().filter(|s| s.optional) {
+            sink.note(format!(
+                "--- virtiofsd not found: the machine starts without its share `{}` ({})",
+                share.tag, share.dir
+            ));
+        }
+    }
     let mut m = match Machine::prepare(spec, &env.root, &env.dir, kvm) {
         Ok(m) => m,
         Err(message) => return StepsResult::before_steps(Ending::Failed, message),
@@ -127,7 +135,9 @@ pub async fn run_test(
         for step in &task.on_failure {
             let outcome = match &step.action {
                 Action::Host { .. } => run_host_step(step, &mut env.host, sink).await,
-                Action::Run { .. } => step_in_machine(&mut m, step, &mut env, sink).await,
+                Action::Run { .. } | Action::Screenshot(_) => {
+                    step_in_machine(&mut m, step, &mut env, sink).await
+                }
                 _ => Ok(()),
             };
             if let Err(e) = outcome {
