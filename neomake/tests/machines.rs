@@ -192,6 +192,14 @@ steps = [{ run = 'true' }]
         stdout.contains("missing-qemu  (requires: no-such-qemu-x9 not found)"),
         "{stdout}"
     );
+    // The plan says so too, and leaves out the image only they need.
+    let (code, stdout, _) = neomake(tmp.path(), &["--no-kvm", "test", "--dry-run"]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("skip        needs-kvm     requires: machine `fake` needs KVM"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("image"), "{stdout}");
 }
 
 #[test]

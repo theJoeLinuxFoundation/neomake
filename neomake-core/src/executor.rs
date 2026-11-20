@@ -468,6 +468,13 @@ pub fn plan(
             Planned::Skip(SkipReason::Disabled(reason.clone()))
         } else if let Some(reason) = task.requires.unmet_in(&options.project_root, &task.env) {
             Planned::Skip(SkipReason::Unmet(reason))
+        } else if let Some(reason) = task
+            .machine
+            .as_ref()
+            .zip(options.machines.as_ref())
+            .and_then(|(machine, runner)| runner.unmet(machine))
+        {
+            Planned::Skip(SkipReason::Unmet(reason))
         } else {
             let dep_keys: Vec<String> = deps.iter().filter_map(|d| keys.get(d).cloned()).collect();
             let key = cache
