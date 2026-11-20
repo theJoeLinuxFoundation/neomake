@@ -16,6 +16,7 @@
 //! in any document. Either may have a `matrix` ([`matrix`]).
 
 mod matrix;
+mod services;
 mod steps;
 
 use std::collections::BTreeMap;
@@ -64,6 +65,8 @@ pub struct Config {
     pub settings: Settings,
     /// Every task and test, in declaration order.
     pub tasks: TaskSet,
+    /// Every service, by name.
+    pub services: BTreeMap<String, crate::services::Service>,
 }
 
 impl Config {
@@ -72,6 +75,7 @@ impl Config {
     pub fn from_sources(root: &Path, sources: &[(PathBuf, String)]) -> Result<Self, ConfigError> {
         let mut settings = Settings::default();
         let mut tasks: Vec<Task> = Vec::new();
+        let mut services: BTreeMap<String, crate::services::Service> = BTreeMap::new();
         let mut defined_in: BTreeMap<String, Location> = BTreeMap::new();
 
         // Templates first, from every document, since any test may use them.
@@ -98,6 +102,36 @@ impl Config {
                     ));
                 }
                 settings = convert_settings(raw_settings.into_inner(), path)?;
+            }
+
+            for (name, raw_service) in raw.services {
+                let location = Location {
+                    file: path.clone(),
+                    line: line_of(text, raw_service.span().start),
+                };
+                if let Some(first) = services.get(&name) {
+                    return Err(ConfigError::new(
+                        path,
+                        Some(location.line),
+                        format!(
+                            "service `{name}` is already defined at {}",
+                            first
+                                .source
+                                .as_ref()
+                                .map(|l| l.to_string())
+                                .unwrap_or_default()
+                        ),
+                    ));
+                }
+                let service = services::convert(&name, raw_service.into_inner(), &location)
+                    .map_err(|m| {
+                        ConfigError::new(
+                            path,
+                            Some(location.line),
+                            format!("service `{name}`: {m}"),
+                        )
+                    })?;
+                services.insert(name, service);
             }
 
             let entries = raw
@@ -171,10 +205,43 @@ impl Config {
             t.deps.dedup();
         }
 
+        // A task that uses a service depends on what the service needs.
+        for t in &mut tasks {
+            for name in t.services.clone() {
+                let Some(service) = services.get(&name) else {
+                    let at = t.source.clone().expect("loaded tasks have a source");
+                    let known: Vec<&str> = services.keys().map(String::as_str).collect();
+                    return Err(ConfigError::new(
+                        &at.file,
+                        Some(at.line),
+                        match crate::executor::closest(&name, known.into_iter()) {
+                            Some(s) => format!(
+                                "`{}` uses no service `{name}` (did you mean `{s}`?)",
+                                t.name
+                            ),
+                            None => format!("`{}` uses no service `{name}`", t.name),
+                        },
+                    ));
+                };
+                for dep in &service.deps {
+                    let expanded = variants_of
+                        .get(dep)
+                        .cloned()
+                        .unwrap_or_else(|| vec![dep.clone()]);
+                    for d in expanded {
+                        if !t.deps.contains(&d) && d != t.name {
+                            t.deps.push(d);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             root: root.to_path_buf(),
             settings,
             tasks: TaskSet::new(tasks),
+            services,
         })
     }
 }
@@ -198,23 +265,35 @@ impl Config {
                 })
                 .unwrap_or_default();
             let mut known: Vec<String> = BUILTIN_VARS.iter().map(|v| v.to_string()).collect();
+            for name in &task.services {
+                if let Some(service) = self.services.get(name) {
+                    known.extend(service.var_names());
+                }
+            }
             let mut report = |line: Option<usize>, what: &str, name: &str| {
                 let at = match line.or(task.source.as_ref().map(|l| l.line)) {
                     Some(l) => format!("{file}:{l}"),
                     None => file.clone(),
                 };
                 problems.push(format!(
-                    "{at}: `{}`: {what} uses `{{{{{name}}}}}`, which nothing defines before it",
+                    "{at}: `{}`: {what} uses `{{{{{name}}}}}`, which nothing defines there",
                     task.name
                 ));
             };
-            let mut top_level = task.clone();
-            top_level.steps.clear();
+            for name in steps_vars::names(&task.command) {
+                if !known.contains(&name) {
+                    report(None, "its command", &name);
+                }
+            }
+            // Placeholders are filled in only in commands and steps.
+            let mut rest = task.clone();
+            rest.steps.clear();
+            rest.command.clear();
             let mut strings = Vec::new();
-            matrix::for_each_string(&mut top_level, &mut |s| strings.push(s.clone()));
+            matrix::for_each_string(&mut rest, &mut |s| strings.push(s.clone()));
             for s in &strings {
                 for name in steps_vars::names(s) {
-                    report(None, "its definition", &name);
+                    report(None, "a field other than its command or steps", &name);
                 }
             }
             for step in &task.steps {
@@ -358,6 +437,7 @@ fn convert_task(
         env_clear: raw.env_clear,
         exclusive: raw.exclusive,
         interactive: raw.interactive,
+        services: raw.services,
         source: Some(at.clone()),
         name,
     })
@@ -374,6 +454,8 @@ struct RawConfig {
     tests: IndexMap<String, Spanned<RawTask>>,
     #[serde(default)]
     templates: IndexMap<String, Spanned<steps::RawTemplate>>,
+    #[serde(default)]
+    services: IndexMap<String, Spanned<services::RawService>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,6 +516,8 @@ struct RawTask {
     exclusive: Vec<String>,
     #[serde(default)]
     interactive: bool,
+    #[serde(default)]
+    services: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -467,13 +551,13 @@ impl RawDuration {
 /// `"bash -eu -c"` or `["bash", "-eu", "-c"]`.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum ShellValue {
+pub(crate) enum ShellValue {
     Line(String),
     Argv(Vec<String>),
 }
 
 impl ShellValue {
-    fn into_argv(self) -> Vec<String> {
+    pub(crate) fn into_argv(self) -> Vec<String> {
         match self {
             ShellValue::Line(line) => line.split_whitespace().map(str::to_string).collect(),
             ShellValue::Argv(argv) => argv,
@@ -822,7 +906,7 @@ steps = [{ run = 'boot {{matrix.media}} from {{matrix.media.device}}', contains 
         assert!(
             problems
                 .iter()
-                .any(|p| p.starts_with("n.toml:7: `b`: its definition uses `{{nope}}`")),
+                .any(|p| p.starts_with("n.toml:7: `b`: its command uses `{{nope}}`")),
             "{problems:?}"
         );
     }

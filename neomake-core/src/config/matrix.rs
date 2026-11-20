@@ -173,6 +173,7 @@ pub(super) fn for_each_string(task: &mut Task, f: &mut dyn FnMut(&mut String)) {
         shell.iter_mut().for_each(&mut *f);
     }
     task.exclusive.iter_mut().for_each(&mut *f);
+    task.services.iter_mut().for_each(&mut *f);
     if let Some(p) = &mut task.prelude {
         f(p);
     }

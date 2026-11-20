@@ -37,6 +37,7 @@ pub mod process;
 pub mod report;
 pub mod rundir;
 pub mod select;
+pub mod services;
 pub mod shell;
 pub mod steps;
 pub mod task;

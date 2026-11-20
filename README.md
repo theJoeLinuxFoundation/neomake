@@ -140,6 +140,7 @@ neomake cache clean       # empties the cache directory
 | `exclusive` | Named locks: tasks naming the same one never overlap. |
 | `interactive` | Run alone, attached to the terminal. |
 | `description`, `tags` | For people, and for selecting tasks. |
+| `services` | Services the task uses, started before it runs. |
 
 `[settings]` in the top-level file sets `state_dir` (where the cache,
 runs and logs go; `.neomake` by default), `default_timeout`, `shell` and
@@ -167,6 +168,23 @@ steps = [
   { run = 'dave --help', contains = "Usage:" },
   { run = 'dave isntall', exit = "nonzero", stream = "combined", contains = "did you mean 'install'?" },
 ]
+```
+
+### Services
+
+`[services.*]` are processes tests need while they run, started before
+their first user and stopped after their last: a command with a
+readiness check (a port, a file, a log line, a URL), or neomake's own
+static file server over HTTP or HTTPS. A taken port is reported as such
+rather than discovered later. See [docs/testing.md](docs/testing.md#5-services).
+
+```toml
+[services.repo]
+serve = { dir = "build/repo", listen = [{ addr = "127.0.0.1:8643" }] }
+
+[tests.install]
+services = ["repo"]
+steps = [{ run = 'dave --repo {{services.repo.url}} install hello' }]
 ```
 
 ### CLI reference

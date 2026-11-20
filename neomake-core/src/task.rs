@@ -152,6 +152,8 @@ pub struct Task {
     pub prelude: Option<String>,
     /// Which variant of a matrix this is, if it is one.
     pub variant: Option<Variant>,
+    /// Services it uses (see [`crate::services`]).
+    pub services: Vec<String>,
 }
 
 /// One combination of a matrix's values.
@@ -192,6 +194,7 @@ impl Task {
             steps: Vec::new(),
             prelude: None,
             variant: None,
+            services: Vec::new(),
         }
     }
 

@@ -14,6 +14,7 @@
 //! "steps:"      <the steps, as Rust debug text> "\n"
 //! "shell:"      for each argv element:         <arg> "\n"     then ".\n"
 //! "cwd:"        <cwd or empty>                 "\n"
+//! "services:"   <service names, comma-separated> "\n"
 //! "env_clear:"  "0" | "1"                      "\n"
 //! "env:"        for each (K=V) in BTreeMap:    K "=" V "\n"   then ".\n"
 //! "deps:"       for each upstream dep_key:     <hex> "\n"     then ".\n"
@@ -166,6 +167,7 @@ impl Cache {
         }
         line(&[b"."]);
         line(&[b"cwd:", task.cwd.as_deref().unwrap_or("").as_bytes()]);
+        line(&[b"services:", task.services.join(",").as_bytes()]);
         line(&[b"env_clear:", if task.env_clear { b"1" } else { b"0" }]);
         line(&[b"env:"]);
         for (k, v) in &task.env {

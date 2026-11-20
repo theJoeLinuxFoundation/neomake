@@ -223,7 +223,82 @@ depends on all of its variants. Tasks may have matrices too.
 
 ---
 
-## 5. Running tests
+## 5. Services
+
+A service is something tests need running while they run: a repository
+served over HTTP, a daemon. It is declared once and used by name:
+
+```toml
+[services.joe-repo]
+description = "build/repo, as guests see it"
+serve = { dir = "build/repo", listen = [{ addr = "127.0.0.1:8643" }] }
+
+[services.test-repo]
+deps = ["deployments-repo"]
+command = "some-server --port 8642 build/deployments-repo"
+ready = { tcp = "127.0.0.1:8642" }
+ready_timeout = "30s"
+
+[tests.deployments]
+services = ["joe-repo", "test-repo"]
+```
+
+A service starts when the first task or test that uses it is about to
+run (after the tasks in the service's own `deps`, which every user
+therefore depends on), and stops when the last one has ended. Before it
+starts, the address it will listen on is checked: if something already
+answers there, every user fails with a message naming the address,
+instead of running against whatever that is. A service that exits, or is
+not ready within `ready_timeout` (30 seconds by default), fails its users
+with the last lines it printed. Each service writes its own log,
+`logs/service-NAME.log`.
+
+### The file server
+
+`serve` is a static file server built into neomake: `GET` and `HEAD` of
+the files in `dir`, with `404 Not Found` for anything else, as Python's
+`http.server` answers. It listens on every address in `listen` (by
+default one free port on `127.0.0.1`). Port 0 picks a free port. A
+listener with `tls = { cert = "…", key = "…" }` (PEM files) speaks HTTPS:
+
+```toml
+[services.cli-net]
+deps = ["cli-certs"]
+serve = { dir = "build/cli-test/repo", listen = [
+  { addr = "127.0.0.1:0" },
+  { name = "here", addr = "127.0.0.1:0", tls = { cert = "build/cli-test/here.pem", key = "build/cli-test/here.key" } },
+] }
+```
+
+Its log has one line per request.
+
+### Commands
+
+A `command` service is a command that keeps running, with one way to
+tell it is ready: `ready = { tcp = "host:port" }` (it accepts
+connections), `{ file = "path" }` (the file exists, relative to its
+`cwd`), `{ log = 'pattern' }` (a line of its output matches) or
+`{ http = "http://…" }` (a request gets an answer). Without `ready`, it
+is ready as soon as it starts. It runs in a process group of its own,
+which is stopped with SIGTERM, then SIGKILL, when the service stops.
+
+### Where services listen
+
+Commands and steps of the tasks that use a service find it through
+placeholders:
+
+| Placeholder | Value |
+|---|---|
+| `{{services.NAME.port}}` | the port of its first address |
+| `{{services.NAME.addr}}` | `127.0.0.1:8643` |
+| `{{services.NAME.url}}` | `http://127.0.0.1:8643` (or `https://`) |
+| `{{services.NAME.LISTENER.port}}`, `.addr`, `.url` | the same, for a named listener |
+
+A command service provides these when it is ready by `tcp` or `http`.
+
+---
+
+## 6. Running tests
 
 ```
 neomake test                     every test, and what they depend on
@@ -260,14 +335,14 @@ neomake log cli-install          a test's log from the last run (--run ID for an
 
 ---
 
-## 6. What a run leaves
+## 7. What a run leaves
 
 Every run has a directory, `<state_dir>/runs/<id>/` (`runs/latest` names
 the newest), which keeps:
 
 - `logs/<name>.log`: everything each task and test printed, with a line
   before each step saying which it is and where it is written, and why it
-  failed;
+  failed; `logs/service-<name>.log` for each service;
 - `tests/<name>/`: each test's own files;
 - `report.json`: every task and test with its status, reason, duration,
   attempts, log, the last lines of each failure, and each test's steps.

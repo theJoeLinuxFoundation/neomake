@@ -139,6 +139,7 @@ fn options_for(cli: &Cli, project: &Project, args: &RunArgs) -> RunOptions {
     options.timeout_scale = args.timeout_scale;
     options.default_timeout = settings.default_timeout;
     options.default_shell = settings.shell.clone();
+    options.services = project.config.services.clone();
     options
 }
 
@@ -336,6 +337,30 @@ fn list(cli: &Cli, tests_only: bool) -> Result<ExitCode> {
             } else if !t.requires.is_empty() {
                 println!("          requirements met");
             }
+        }
+    }
+    if !tests_only && !project.config.services.is_empty() {
+        println!("services:");
+        for service in project.config.services.values() {
+            let what = match &service.kind {
+                neomake_core::services::ServiceKind::Serve { dir, listeners } => format!(
+                    "serves {dir} on {}",
+                    listeners
+                        .iter()
+                        .map(|l| l.addr.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                neomake_core::services::ServiceKind::Command { command, .. } => {
+                    neomake_core::steps::summarize(command)
+                }
+            };
+            let about = service
+                .description
+                .as_ref()
+                .map(|d| format!("  {d}"))
+                .unwrap_or_default();
+            println!("  {}  {what}{about}", service.name);
         }
     }
     Ok(ExitCode::from(0))

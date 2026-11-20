@@ -39,6 +39,7 @@ use crate::dag::Dag;
 use crate::error::ExecError;
 use crate::process::{self, Invocation, Stream};
 use crate::rundir;
+use crate::services::{Service, ServiceEvent, Services};
 use crate::shell;
 use crate::steps::host::{self, Ending, HostEnv, Runner};
 use crate::steps::vars::Vars;
@@ -263,6 +264,25 @@ pub enum ExecutionEvent {
         /// Why.
         reason: SkipReason,
     },
+    /// A service is ready.
+    ServiceStarted {
+        /// The service.
+        name: String,
+        /// Where it listens, or what it runs.
+        detail: String,
+    },
+    /// A service could not start.
+    ServiceFailed {
+        /// The service.
+        name: String,
+        /// Why.
+        message: String,
+    },
+    /// A service was stopped.
+    ServiceStopped {
+        /// The service.
+        name: String,
+    },
     /// A test started a new section.
     Section {
         /// Task name.
@@ -329,6 +349,8 @@ pub struct RunOptions {
     pub tail_lines: usize,
     /// The run's directory; tests keep their files under `tests/` in it.
     pub artifact_dir: Option<PathBuf>,
+    /// The services tasks may use, by name.
+    pub services: BTreeMap<String, Service>,
 }
 
 impl RunOptions {
@@ -346,6 +368,7 @@ impl RunOptions {
             cancel: CancellationToken::new(),
             tail_lines: 40,
             artifact_dir: None,
+            services: BTreeMap::new(),
         }
     }
 }
@@ -499,6 +522,7 @@ struct Context {
     reporter: Reporter,
     sem: Arc<Semaphore>,
     locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    services: Services,
 }
 
 /// Run `tasks` in parallel honoring their dependency order.
@@ -516,15 +540,42 @@ pub async fn run(
         .flat_map(|t| t.exclusive.iter())
         .map(|name| (name.clone(), Arc::new(tokio::sync::Mutex::new(()))))
         .collect();
+    let reporter = reporter.unwrap_or_else(|| Arc::new(|_| {}));
+    let mut users: BTreeMap<String, usize> = BTreeMap::new();
+    for t in tasks {
+        for name in &t.services {
+            *users.entry(name.clone()).or_insert(0) += 1;
+        }
+    }
+    let service_reporter = Arc::clone(&reporter);
+    let services = Services::new(
+        &options.services,
+        &users,
+        &options.project_root,
+        options.log_dir.as_deref(),
+        default_shell(options),
+        Arc::new(move |event| {
+            service_reporter(match event {
+                ServiceEvent::Started { name, detail } => {
+                    ExecutionEvent::ServiceStarted { name, detail }
+                }
+                ServiceEvent::Failed { name, message } => {
+                    ExecutionEvent::ServiceFailed { name, message }
+                }
+                ServiceEvent::Stopped { name } => ExecutionEvent::ServiceStopped { name },
+            })
+        }),
+    );
     let ctx = Arc::new(Context {
         cache: cache.clone(),
         opts: RunOptions {
             concurrency: options.concurrency.max(1),
             ..options.clone()
         },
-        reporter: reporter.unwrap_or_else(|| Arc::new(|_| {})),
+        reporter,
         sem: Arc::new(Semaphore::new(options.concurrency.max(1))),
         locks,
+        services,
     });
     if let Some(dir) = &ctx.opts.log_dir {
         std::fs::create_dir_all(dir).map_err(|source| ExecError::Io {
@@ -551,7 +602,11 @@ pub async fn run(
         let my_sender = senders.remove(&task.name).expect("sender prepared");
         let ctx = Arc::clone(&ctx);
         join_set.spawn(async move {
+            let services = task.services.clone();
             let outcome = run_single(task, dep_receivers, &ctx).await;
+            for name in &services {
+                ctx.services.release(name).await;
+            }
             if ctx.opts.fail_fast && outcome.status.is_failure() && !outcome.allowed_failure {
                 ctx.opts.cancel.cancel();
             }
@@ -565,6 +620,7 @@ pub async fn run(
         let outcome = joined.map_err(|e| ExecError::Plan(format!("a task panicked: {e}")))?;
         outcomes.insert(outcome.name.clone(), outcome);
     }
+    ctx.services.stop_all().await;
     if let Err(e) = ctx.cache.flush() {
         tracing::warn!(error = %e, "could not save the remembered input hashes");
     }
@@ -663,6 +719,16 @@ async fn run_single(
         }
     }
 
+    // Services it uses, started if they are not running yet.
+    let mut service_vars = Vec::new();
+    for name in &task.services {
+        match ctx.services.acquire(name, &ctx.opts.cancel).await {
+            Ok(vars) => service_vars.extend(vars),
+            Err(_) if ctx.opts.cancel.is_cancelled() => return skip(SkipReason::Stopped),
+            Err(message) => return fail_early(&task, ctx, message),
+        }
+    }
+
     // Locks, then a concurrency slot (every slot, for an interactive task).
     let mut names: Vec<&String> = task.exclusive.iter().collect();
     names.sort();
@@ -688,7 +754,7 @@ async fn run_single(
         _ = ctx.opts.cancel.cancelled() => return skip(SkipReason::Stopped),
     };
 
-    let mut outcome = execute(&task, ctx).await;
+    let mut outcome = execute(&task, ctx, &service_vars).await;
     outcome.cache_key = Some(cache_key.clone());
 
     if outcome.status == TaskStatus::Success && caching {
@@ -801,7 +867,7 @@ struct Attempt {
 }
 
 /// Run the task, as many times as its retries allow.
-async fn execute(task: &Task, ctx: &Context) -> TaskOutcome {
+async fn execute(task: &Task, ctx: &Context, service_vars: &[(String, String)]) -> TaskOutcome {
     let log_path = ctx
         .opts
         .log_dir
@@ -840,10 +906,14 @@ async fn execute(task: &Task, ctx: &Context) -> TaskOutcome {
             attempt,
         });
 
+        let mut vars = base_vars(task, &ctx.opts, test_dir.as_deref());
+        for (name, value) in service_vars {
+            vars.set(name.clone(), value.clone());
+        }
         let result = if task.steps.is_empty() {
-            command_attempt(task, ctx, &sink, timeout).await
+            command_attempt(task, ctx, &sink, timeout, &vars).await
         } else {
-            steps_attempt(task, ctx, &sink, timeout, test_dir.as_deref()).await
+            steps_attempt(task, ctx, &sink, timeout, test_dir.as_deref(), vars).await
         };
         outcome.status = result.status.clone();
         outcome.exit_code = result.exit_code;
@@ -897,6 +967,7 @@ async fn command_attempt(
     ctx: &Context,
     sink: &Sink,
     timeout: Option<Duration>,
+    vars: &Vars,
 ) -> Attempt {
     let failed = |message: String| Attempt {
         status: TaskStatus::Failed,
@@ -904,10 +975,14 @@ async fn command_attempt(
         message: Some(message),
         steps: Vec::new(),
     };
-    let invocation = match invocation_for(task, &ctx.opts) {
+    let mut invocation = match invocation_for(task, &ctx.opts) {
         Ok(inv) => inv,
         Err(message) => return failed(message),
     };
+    // A command's placeholders: services' addresses and the run's paths.
+    if let Some(command) = invocation.args.last_mut() {
+        *command = crate::steps::vars::substitute_known(command, &|n| vars.get(n));
+    }
     let result = process::run(&invocation, timeout, &ctx.opts.cancel, |stream, line| {
         sink.line(stream, line)
     })
@@ -951,6 +1026,7 @@ async fn steps_attempt(
     sink: &Sink,
     timeout: Option<Duration>,
     test_dir: Option<&Path>,
+    vars: Vars,
 ) -> Attempt {
     let failed = |message: String| Attempt {
         status: TaskStatus::Failed,
@@ -962,14 +1038,12 @@ async fn steps_attempt(
         Ok(cwd) => cwd,
         Err(message) => return failed(message),
     };
-    let mut vars = base_vars(task, &ctx.opts, test_dir);
     let mut env = task.env.clone();
     if let Some(dir) = test_dir {
         env.insert(
             "NEOMAKE_TEST_DIR".into(),
             absolute(dir).display().to_string(),
         );
-        vars.set("test.dir", absolute(dir).display().to_string());
     }
     let mut host_env = HostEnv {
         shell: shell_argv(task, &ctx.opts),
@@ -1034,7 +1108,15 @@ fn absolute(path: &Path) -> PathBuf {
 
 /// The shell `task` runs its commands with.
 fn shell_argv(task: &Task, opts: &RunOptions) -> Vec<String> {
-    match task.shell.as_ref().or(opts.default_shell.as_ref()) {
+    match &task.shell {
+        Some(argv) => argv.clone(),
+        None => default_shell(opts),
+    }
+}
+
+/// The shell of tasks that set none.
+fn default_shell(opts: &RunOptions) -> Vec<String> {
+    match &opts.default_shell {
         Some(argv) => argv.clone(),
         None => {
             let s = shell::resolve();

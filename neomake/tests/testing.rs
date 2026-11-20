@@ -218,7 +218,7 @@ fn check_and_list() {
     let (code, stdout, _) = neomake(tmp.path(), &["check"]);
     assert_eq!(code, 1);
     assert!(
-        stdout.contains("tests/bad.tomlx:2: `bad`: a step uses `{{never_captured}}`"),
+        stdout.contains("tests/bad.tomlx:2: `bad`: a step uses `{{never_captured}}`, which nothing defines there"),
         "{stdout}"
     );
 }
@@ -245,4 +245,125 @@ fn grouped_output_on_github_actions() {
     );
     let md = fs::read_to_string(&summary).unwrap();
     assert!(md.contains("| ❌ | `broken` |"), "{md}");
+}
+
+fn have(program: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", &format!("command -v {program}")])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn services_serve_files_over_http_and_https() {
+    if !(have("curl") && have("openssl")) {
+        eprintln!("skipped: needs curl and openssl");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("repo")).unwrap();
+    fs::create_dir_all(tmp.path().join("pki")).unwrap();
+    fs::write(tmp.path().join("repo/repo.zon"), "index\n").unwrap();
+    fs::write(
+        tmp.path().join("neomake.toml"),
+        r#"
+[tasks.certs]
+cwd = "pki"
+command = '''
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj "/CN=test ca" \
+  -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign -keyout ca.key -out ca.pem 2>/dev/null
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=here" -keyout here.key -out here.csr 2>/dev/null
+printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > ext
+openssl x509 -req -in here.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile ext -out here.pem 2>/dev/null
+'''
+
+[services.repo]
+deps = ["certs"]
+serve = { dir = "repo", listen = [
+  { addr = "127.0.0.1:0" },
+  { name = "tls", addr = "127.0.0.1:0", tls = { cert = "pki/here.pem", key = "pki/here.key" } },
+] }
+
+[services.marker]
+command = "echo $$ > marker.pid; sleep 0.2; touch marker-up; exec sleep 60"
+ready = { file = "marker-up" }
+
+[tests.fetch]
+services = ["repo", "marker"]
+steps = [
+  { run = 'curl -sS {{services.repo.url}}/repo.zon', equals = "index" },
+  { run = 'curl -sS -o /dev/null -w "%{http_code}" {{services.repo.url}}/nowhere/repo.zon', equals = "404" },
+  { run = 'curl -sS --cacert pki/ca.pem {{services.repo.tls.url}}/repo.zon', equals = "index" },
+  { run = 'curl -sS {{services.repo.tls.url}}/repo.zon', exit = "nonzero", stream = "stderr", contains = "certificate" },
+  { run = 'test -e marker-up' },
+]
+
+[tests.also]
+services = ["marker"]
+command = "test -e marker-up"
+"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = neomake(tmp.path(), &["test"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("[SERVICE] repo  http://127.0.0.1:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(", https://127.0.0.1:"), "{stdout}");
+    assert!(stdout.contains("[SERVICE] marker  stopped"), "{stdout}");
+    let log = fs::read_to_string(
+        tmp.path()
+            .join(".neomake/runs/latest/logs/service-repo.log"),
+    )
+    .unwrap();
+    assert!(log.contains("GET /nowhere/repo.zon 404"), "{log}");
+    // The service's process did not outlive the run.
+    let pid = fs::read_to_string(tmp.path().join("marker.pid")).unwrap();
+    assert!(
+        !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+        "service process {} outlived the run",
+        pid.trim()
+    );
+}
+
+#[test]
+fn a_service_that_cannot_start_fails_its_users() {
+    let tmp = tempfile::tempdir().unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    fs::write(
+        tmp.path().join("neomake.toml"),
+        format!(
+            r#"
+[services.clash]
+command = "sleep 60"
+ready = {{ tcp = "127.0.0.1:{port}" }}
+
+[tests.user]
+services = ["clash"]
+command = "true"
+
+[tests.unknown]
+command = "echo {{{{services.clash.port}}}}"
+"#
+        ),
+    )
+    .unwrap();
+    let (code, stdout, _) = neomake(tmp.path(), &["test", "user"]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "service `clash` did not start: something is already listening on 127.0.0.1:{port}"
+        )),
+        "{stdout}"
+    );
+    let (code, stdout, _) = neomake(tmp.path(), &["check"]);
+    assert_eq!(code, 1);
+    assert!(
+        stdout.contains("`unknown`: its command uses `{{services.clash.port}}`"),
+        "{stdout}"
+    );
+    drop(taken);
 }

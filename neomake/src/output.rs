@@ -155,6 +155,18 @@ fn status_line(event: ExecutionEvent, style: Style, buffers: &Mutex<HashMap<Stri
             let line = format!("{} {task}  stopped", c("magenta", "[STOPPED]"));
             (task, line, true)
         }
+        ExecutionEvent::ServiceStarted { name, detail } => {
+            let line = format!("{} {name}  {detail}", c("cyan", "[SERVICE]"));
+            (name, line, false)
+        }
+        ExecutionEvent::ServiceFailed { name, message } => {
+            let line = format!("{} {name}  {message}", c("red", "[SERVICE]"));
+            (name, line, false)
+        }
+        ExecutionEvent::ServiceStopped { name } => {
+            let line = format!("{} {name}  stopped", c("dim", "[SERVICE]"));
+            (name, line, false)
+        }
         ExecutionEvent::Skipped { task, reason } => {
             let line = format!(
                 "{} {task}  ({})",

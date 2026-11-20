@@ -21,6 +21,8 @@ indexmap = { workspace = true }
 tokio-util = { workspace = true }
 which = { workspace = true }
 regex = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
