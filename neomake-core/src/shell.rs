@@ -65,7 +65,12 @@ fn compute() -> ShellInvocation {
 }
 
 fn override_from_env() -> Option<ShellInvocation> {
-    let raw = std::env::var("NEOMAKE_SHELL").ok()?;
+    parse_override(&std::env::var("NEOMAKE_SHELL").ok()?)
+}
+
+/// `NEOMAKE_SHELL`'s value as an invocation: whitespace-separated argv;
+/// none when it is blank.
+fn parse_override(raw: &str) -> Option<ShellInvocation> {
     let mut tokens = raw.split_whitespace();
     let program = tokens.next()?.to_string();
     let args: Vec<String> = tokens.map(str::to_string).collect();
@@ -96,31 +101,18 @@ fn default_for_platform() -> ShellInvocation {
 mod tests {
     use super::*;
 
+    // The override is tested by its parser alone: setting NEOMAKE_SHELL
+    // here would race with every other test that resolves the shell.
     #[test]
     fn override_parses_argv() {
-        // Use compute() rather than resolve() so we don't poison the
-        // global cache for other tests in this binary.
-        let saved = std::env::var("NEOMAKE_SHELL").ok();
-        // SAFETY: tests in a single-threaded section. We restore below.
-        std::env::set_var("NEOMAKE_SHELL", "bash -c");
-        let inv = override_from_env().expect("override parsed");
+        let inv = parse_override("bash -c").expect("override parsed");
         assert_eq!(inv.program, "bash");
         assert_eq!(inv.args, vec!["-c".to_string()]);
-        match saved {
-            Some(v) => std::env::set_var("NEOMAKE_SHELL", v),
-            None => std::env::remove_var("NEOMAKE_SHELL"),
-        }
     }
 
     #[test]
     fn empty_override_is_ignored() {
-        let saved = std::env::var("NEOMAKE_SHELL").ok();
-        std::env::set_var("NEOMAKE_SHELL", "   ");
-        assert!(override_from_env().is_none());
-        match saved {
-            Some(v) => std::env::set_var("NEOMAKE_SHELL", v),
-            None => std::env::remove_var("NEOMAKE_SHELL"),
-        }
+        assert!(parse_override("   ").is_none());
     }
 
     #[test]
