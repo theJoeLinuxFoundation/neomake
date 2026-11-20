@@ -36,7 +36,9 @@ each other.
   program is not on `PATH`, a path does not exist (such as `/dev/kvm`),
   or a variable is unset, the test is **skipped**, with that reason,
   rather than failed. So is everything that depends on it. Programs are
-  looked for on the `PATH` the test's `env` sets, if it sets one.
+  looked for on the `PATH` the test's `env` sets, if it sets one. What
+  only skipped tests depend on is not run at all, so a host without KVM
+  does not build images for machine tests it will skip.
 - `skip = "reason"` skips it unconditionally, which with TOMLX can be
   conditional: `skip = if env("DAVE", "") != "" { "DAVE overrides the binary" } else { false }`.
 - `allow_failure = true` reports a failure without failing the run.
