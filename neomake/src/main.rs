@@ -29,7 +29,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
 use neomake_core::report::{Report, RunMeta};
-use neomake_core::select::{select, Selection};
+use neomake_core::select::{select_with_roots, Selection};
 use neomake_core::{executor, junit, Cache, Config, Dag, Planned, RunDir, RunOptions};
 
 use crate::cli::{CacheCommand, Cli, Command, MachineCommand, OutputMode, RunArgs};
@@ -214,7 +214,7 @@ fn run(cli: &Cli, patterns: &[String], args: &RunArgs, tests_only: bool) -> Resu
     }
     let project = Project::load(cli.config.as_deref())?;
     let dag = project.dag()?;
-    let selected = select(
+    let (selected, roots) = select_with_roots(
         &dag,
         &Selection {
             patterns: patterns.to_vec(),
@@ -232,6 +232,17 @@ fn run(cli: &Cli, patterns: &[String], args: &RunArgs, tests_only: bool) -> Resu
     }
     let cache = project.cache()?;
     let mut options = options_for(cli, &project, args);
+    // A test this host cannot run does not need its images built.
+    let runner = options.machines.clone();
+    let root = project.root().to_path_buf();
+    let selected = neomake_core::select::prune_skipped(selected, &roots, |t| {
+        t.skip.is_some()
+            || t.requires.unmet_in(&root, &t.env).is_some()
+            || t.machine
+                .as_ref()
+                .zip(runner.as_ref())
+                .is_some_and(|(m, r)| r.unmet(m).is_some())
+    });
 
     if args.dry_run {
         return dry_run(&selected, &cache, &options);

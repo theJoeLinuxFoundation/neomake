@@ -60,6 +60,15 @@ pub fn wildcard_match(pattern: &str, name: &str) -> bool {
 /// The tasks `selection` chooses, with everything they depend on, in the
 /// DAG's order.
 pub fn select(dag: &Dag, selection: &Selection) -> Result<Vec<Task>, ExecError> {
+    select_with_roots(dag, selection).map(|(tasks, _)| tasks)
+}
+
+/// Like [`select`], with the names of the tasks chosen for themselves
+/// (rather than as something another needs).
+pub fn select_with_roots(
+    dag: &Dag,
+    selection: &Selection,
+) -> Result<(Vec<Task>, BTreeSet<String>), ExecError> {
     let tasks = dag.tasks();
     let eligible = |t: &Task| !selection.tests_only || t.is_test();
 
@@ -110,7 +119,7 @@ pub fn select(dag: &Dag, selection: &Selection) -> Result<Vec<Task>, ExecError> 
     });
 
     let mut selected: BTreeSet<String> = BTreeSet::new();
-    let mut stack: Vec<String> = roots.into_iter().collect();
+    let mut stack: Vec<String> = roots.iter().cloned().collect();
     while let Some(n) = stack.pop() {
         if !selected.insert(n.clone()) {
             continue;
@@ -119,11 +128,65 @@ pub fn select(dag: &Dag, selection: &Selection) -> Result<Vec<Task>, ExecError> 
             stack.push(d.clone());
         }
     }
-    Ok(tasks
+    let chosen = tasks
         .iter()
         .filter(|t| selected.contains(&t.name))
         .cloned()
-        .collect())
+        .collect();
+    Ok((chosen, roots))
+}
+
+/// `tasks` (a selection, in order, chosen for `roots`) without what only
+/// tasks that will be skipped anyway need. A task for which `skipped` is
+/// true does not run whatever its dependencies do, so it is kept, with no
+/// dependencies, to be reported as skipped; any other task stays only if
+/// it is a root or something that runs needs it.
+pub fn prune_skipped(
+    tasks: Vec<Task>,
+    roots: &BTreeSet<String>,
+    skipped: impl Fn(&Task) -> bool,
+) -> Vec<Task> {
+    let skip: BTreeSet<String> = tasks
+        .iter()
+        .filter(|t| skipped(t))
+        .map(|t| t.name.clone())
+        .collect();
+    if skip.is_empty() {
+        return tasks;
+    }
+    let by_name: std::collections::BTreeMap<&str, &Task> =
+        tasks.iter().map(|t| (t.name.as_str(), t)).collect();
+    // What the tasks that do run need, transitively.
+    let mut needed: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<String> = roots
+        .iter()
+        .filter(|r| !skip.contains(*r))
+        .cloned()
+        .collect();
+    while let Some(n) = stack.pop() {
+        if !needed.insert(n.clone()) {
+            continue;
+        }
+        if skip.contains(&n) {
+            continue;
+        }
+        if let Some(t) = by_name.get(n.as_str()) {
+            stack.extend(t.deps.iter().cloned());
+        }
+    }
+    tasks
+        .into_iter()
+        .filter_map(|mut t| {
+            if skip.contains(&t.name) {
+                t.deps.clear();
+                Some(t)
+            } else if needed.contains(&t.name) {
+                Some(t)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -204,6 +267,21 @@ mod tests {
             .len(),
             3
         );
+    }
+
+    #[test]
+    fn what_only_skipped_tasks_need_is_left_out() {
+        let tasks = vec![
+            Task::new("image", "i"),
+            Task::new("shared", "s"),
+            Task::new("vm", "v").with_deps(&["image", "shared"]),
+            Task::new("cli", "c").with_deps(&["shared"]),
+        ];
+        let roots: BTreeSet<String> = ["vm".to_string(), "cli".to_string()].into();
+        let kept = prune_skipped(tasks, &roots, |t| t.name == "vm");
+        let names: Vec<&str> = kept.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["shared", "vm", "cli"]);
+        assert!(kept[1].deps.is_empty());
     }
 
     #[test]
