@@ -51,11 +51,21 @@ impl Requirements {
     /// Every requirement that is not met, described for a person, or
     /// `None` when all are.
     pub fn unmet(&self, root: &Path) -> Option<String> {
+        self.unmet_in(root, &BTreeMap::new())
+    }
+
+    /// Like [`Self::unmet`], for a task whose environment is `env`:
+    /// programs are looked for on the `PATH` it sets, if it sets one.
+    pub fn unmet_in(&self, root: &Path, env: &BTreeMap<String, String>) -> Option<String> {
         let mut missing = Vec::new();
+        let found = |c: &str| match env.get("PATH") {
+            Some(path) => which::which_in(c, Some(path), root).is_ok(),
+            None => which::which(c).is_ok(),
+        };
         let commands: Vec<&str> = self
             .commands
             .iter()
-            .filter(|c| which::which(c.as_str()).is_err())
+            .filter(|c| !found(c.as_str()))
             .map(String::as_str)
             .collect();
         if !commands.is_empty() {
@@ -411,5 +421,27 @@ mod tests {
             ..Requirements::default()
         };
         assert_eq!(met.unmet(tmp.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn programs_are_looked_for_on_the_tasks_own_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("tools/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("only-here-x9"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            bin.join("only-here-x9"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let req = Requirements {
+            commands: vec!["only-here-x9".into()],
+            ..Requirements::default()
+        };
+        assert!(req.unmet(tmp.path()).is_some());
+        let env = BTreeMap::from([("PATH".to_string(), bin.display().to_string())]);
+        assert_eq!(req.unmet_in(tmp.path(), &env), None);
     }
 }

@@ -59,7 +59,10 @@ steps = [{ run = 'tool {{what}}', contains = "{{text}}" }]
 description = "the tool's command line"
 tags = ["fast"]
 env = { PATH = "${path}" }
-prelude = 'quiet() { "$@" >/dev/null 2>&1; }'
+prelude = '''
+quiet() { "$@" >/dev/null 2>&1; }
+me="{{test.name}}"
+'''
 steps = [
   { section = "version" },
   { run = 'tool version', capture = { version = 'tool (\S+)' } },
@@ -68,6 +71,7 @@ steps = [
   { section = "mistakes" },
   { run = 'tool bogus', exit = 2, stream = "stderr", contains = "usage:" },
   { run = 'quiet tool bogus', exit = "nonzero" },
+  { run = 'echo "$me"', equals = "cli" },
   { section = "questions" },
   { run = 'tool ask', tty = { respond = [{ on = '\[Y/n\]', send = "n\n" }] }, exit = 1, contains = "Nothing was changed." },
   { run = 'tool ask', tty = { respond = [{ on = '\[Y/n\]', send = "y\n" }], forbid = 'Nothing' }, contains = "yes" },
@@ -104,7 +108,7 @@ fn steps_check_capture_and_answer() {
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(stdout.contains("cli == questions"), "{stdout}");
     assert!(
-        stdout.contains("✓ step 3/8 says › run: tool version"),
+        stdout.contains("✓ step 3/9 says › run: tool version"),
         "{stdout}"
     );
     assert!(stdout.contains("[OK     ] cli"), "{stdout}");
@@ -133,7 +137,7 @@ fn a_failing_step_is_named_with_its_line() {
     assert_eq!(code, 1, "{stdout}");
     assert!(
         stdout.contains(
-            "broken: step 2/3 (tests/cli.tomlx:31) `the version is 2.0`: expected stdout to contain \"2.0\""
+            "broken: step 2/3 (tests/cli.tomlx:35) `the version is 2.0`: expected stdout to contain \"2.0\""
         ),
         "{stdout}"
     );
@@ -171,7 +175,7 @@ fn selection_by_pattern_matrix_and_tag() {
             })
         })
     };
-    assert!(has(&["would run cli 8 steps"]), "{stdout}");
+    assert!(has(&["would run cli 9 steps"]), "{stdout}");
     assert!(has(&["would run media[media=cd] 1 step"]), "{stdout}");
     assert!(
         has(&["skip unmet requires: no-such-qemu-x9 not found"]),
@@ -240,7 +244,7 @@ fn grouped_output_on_github_actions() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("::error file=tests/cli.tomlx,line=31,title=broken::step 2/3"),
+        stdout.contains("::error file=tests/cli.tomlx,line=35,title=broken::step 2/3"),
         "{stdout}"
     );
     let md = fs::read_to_string(&summary).unwrap();

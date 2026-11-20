@@ -43,7 +43,17 @@ pub async fn run_test(
         Ok(m) => m,
         Err(message) => return StepsResult::before_steps(Ending::Failed, message),
     };
-    m.on_boot = task.on_boot.clone();
+    m.on_boot = match task
+        .on_boot
+        .as_deref()
+        .map(|b| env.host.vars.apply(b))
+        .transpose()
+    {
+        Ok(b) => b,
+        Err(message) => {
+            return StepsResult::before_steps(Ending::Failed, format!("on_boot: {message}"))
+        }
+    };
 
     let vars = &mut env.host.vars;
     vars.set("machine.name", spec.name.clone());

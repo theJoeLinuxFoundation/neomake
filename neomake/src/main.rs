@@ -397,7 +397,7 @@ fn list(cli: &Cli, tests_only: bool) -> Result<ExitCode> {
             }
             if let Some(reason) = &t.skip {
                 println!("          skipped: {reason}");
-            } else if let Some(reason) = t.requires.unmet(project.root()) {
+            } else if let Some(reason) = t.requires.unmet_in(project.root(), &t.env) {
                 println!("          requires, and is missing: {reason}");
             } else if !t.requires.is_empty() {
                 println!("          requirements met");

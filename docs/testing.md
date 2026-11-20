@@ -35,7 +35,8 @@ each other.
 - `requires = { commands = [...], files = [...], env = [...] }`: when a
   program is not on `PATH`, a path does not exist (such as `/dev/kvm`),
   or a variable is unset, the test is **skipped**, with that reason,
-  rather than failed. So is everything that depends on it.
+  rather than failed. So is everything that depends on it. Programs are
+  looked for on the `PATH` the test's `env` sets, if it sets one.
 - `skip = "reason"` skips it unconditionally, which with TOMLX can be
   conditional: `skip = if env("DAVE", "") != "" { "DAVE overrides the binary" } else { false }`.
 - `allow_failure = true` reports a failure without failing the run.
@@ -77,7 +78,8 @@ Each step is an inline table with one action:
 Every step that runs a command is its own shell process, started in the
 test's `cwd` with its `env` and `shell`. The test's `prelude`, if any, is
 put in front of each one, so it is the place for shell functions and
-variables the steps share. Variables a step sets do not reach the next
+variables the steps share; its placeholders are filled in as the steps'
+are. Variables a step sets do not reach the next
 step; files do.
 
 **Write scripts in literal strings** (`'…'` or `'''…'''`). In basic

@@ -345,10 +345,19 @@ impl Config {
                     report(None, "its command", &name);
                 }
             }
-            // Placeholders are filled in only in commands and steps.
+            for text in task.prelude.iter().chain(task.on_boot.iter()) {
+                for name in steps_vars::names(text) {
+                    if !known.contains(&name) {
+                        report(None, "its prelude or on_boot", &name);
+                    }
+                }
+            }
+            // Placeholders are filled in only in commands, preludes and steps.
             let mut rest = task.clone();
             rest.steps.clear();
             rest.command.clear();
+            rest.prelude = None;
+            rest.on_boot = None;
             let mut strings = Vec::new();
             matrix::for_each_string(&mut rest, &mut |s| strings.push(s.clone()));
             for s in &strings {

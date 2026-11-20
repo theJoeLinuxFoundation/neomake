@@ -466,7 +466,7 @@ pub fn plan(
             })
         } else if let Some(reason) = &task.skip {
             Planned::Skip(SkipReason::Disabled(reason.clone()))
-        } else if let Some(reason) = task.requires.unmet(&options.project_root) {
+        } else if let Some(reason) = task.requires.unmet_in(&options.project_root, &task.env) {
             Planned::Skip(SkipReason::Unmet(reason))
         } else {
             let dep_keys: Vec<String> = deps.iter().filter_map(|d| keys.get(d).cloned()).collect();
@@ -685,7 +685,7 @@ async fn run_single(
     if let Some(reason) = &task.skip {
         return skip(SkipReason::Disabled(reason.clone()));
     }
-    if let Some(reason) = task.requires.unmet(&ctx.opts.project_root) {
+    if let Some(reason) = task.requires.unmet_in(&ctx.opts.project_root, &task.env) {
         return skip(SkipReason::Unmet(reason));
     }
     if let Some(machine) = &task.machine {
@@ -1081,12 +1081,17 @@ async fn steps_attempt(
             absolute(dir).display().to_string(),
         );
     }
+    // The prelude's placeholders are filled in like the steps'.
+    let prelude = match task.prelude.as_deref().map(|p| vars.apply(p)).transpose() {
+        Ok(p) => p,
+        Err(message) => return failed(format!("prelude: {message}")),
+    };
     let mut host_env = HostEnv {
         shell: shell_argv(task, &ctx.opts),
         cwd,
         env,
         env_clear: task.env_clear,
-        prelude: task.prelude.clone(),
+        prelude,
         deadline: timeout.map(|t| Instant::now() + t),
         cancel: &ctx.opts.cancel,
         vars,
