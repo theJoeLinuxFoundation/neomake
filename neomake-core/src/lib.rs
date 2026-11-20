@@ -28,6 +28,7 @@ pub mod cache;
 pub mod dag;
 pub mod error;
 pub mod executor;
+pub mod glob;
 pub mod shell;
 pub mod task;
 
